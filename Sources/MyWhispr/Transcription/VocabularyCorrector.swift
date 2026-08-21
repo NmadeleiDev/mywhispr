@@ -72,7 +72,7 @@ enum VocabularyCorrector {
 
     private static func correct(_ text: String, using terms: [Term]) -> String {
         guard !text.isEmpty else { return text }
-        var tokens = tokenize(text)
+        var tokens = WordTokens.split(text)
         let wordPositions = tokens.indices.filter { tokens[$0].isWord }
         guard !wordPositions.isEmpty else { return text }
 
@@ -93,7 +93,7 @@ enum VocabularyCorrector {
             }
             cursor += max(matchedLength, 1)
         }
-        return tokens.map(\.text).joined()
+        return WordTokens.join(tokens)
     }
 
     /// The single closest term, or nil when nothing is close enough or two terms are
@@ -130,44 +130,6 @@ enum VocabularyCorrector {
         // A term that would rewrite a word into something completely different is a
         // coincidence, not a correction.
         return best.term
-    }
-
-    // MARK: - Tokenizing
-
-    struct Token {
-        var text: String
-        var isWord: Bool
-    }
-
-    /// Splits into alternating word and separator runs. Apostrophes and hyphens stay
-    /// inside a word so "don't" and "half-life" are single candidates.
-    static func tokenize(_ text: String) -> [Token] {
-        var tokens: [Token] = []
-        var current = ""
-        var currentIsWord: Bool?
-
-        func flush() {
-            guard let currentIsWord, !current.isEmpty else { return }
-            tokens.append(Token(text: current, isWord: currentIsWord))
-            current = ""
-        }
-
-        for character in text {
-            let isWord = character.isLetter || character.isNumber || character == "'" || character == "’" || character == "-"
-            if isWord != currentIsWord {
-                flush()
-                currentIsWord = isWord
-            }
-            current.append(character)
-        }
-        flush()
-
-        // A run of only apostrophes or hyphens is punctuation, not a word.
-        return tokens.map { token in
-            guard token.isWord else { return token }
-            let hasContent = token.text.contains { $0.isLetter || $0.isNumber }
-            return Token(text: token.text, isWord: hasContent)
-        }
     }
 
     // MARK: - Distance

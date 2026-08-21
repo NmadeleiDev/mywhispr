@@ -32,12 +32,38 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
     /// dictation while a larger one writes meeting notes.
     var summaryModel = ""
     var rewriteEnabled = false
-    var rewritePrompt = "Rewrite this transcript into clean, concise prose. Preserve meaning, names, technical terms, and the original language. Return only the rewritten text."
+    var rewritePrompt = LocalAIConfiguration.defaultRewritePrompt
     var summaryPrompt = "Create concise meeting notes with decisions and action items. Do not invent facts. Return Markdown."
     /// Rewriting runs inside the gap between releasing the key and seeing text
     /// appear, so it is bounded hard. Past this, the faithful transcript wins.
     var rewriteTimeoutSeconds: Double = 4
     var allowLAN = false
+
+    /// Polish, not rewriting.
+    ///
+    /// The instruction is negative on purpose. Asked to "rewrite this into clean
+    /// prose", a model does exactly that — it paraphrases, and the words that come
+    /// back are its own rather than the owner's. Dictation is the owner writing, so
+    /// every transformation beyond tidying has to be closed off by name.
+    static let defaultRewritePrompt = """
+    You clean up dictated text. Return the same text with only these changes: \
+    remove filler sounds, false starts and accidental repetitions; fix punctuation, \
+    capitalisation, and obvious speech-recognition slips.
+
+    Never paraphrase, summarise, translate, reorder, shorten or add anything. Keep \
+    the speaker's own words, wording, tone and language. Keep names, technical \
+    terms, identifiers and URLs exactly as written. If the text is already clean, \
+    return it unchanged.
+
+    Reply with the corrected text only — no preamble, quotes, code fences or notes.
+    """
+
+    /// Defaults that shipped previously. A stored prompt matching one of these was
+    /// never edited by the owner, so it is theirs only by accident and is replaced;
+    /// anything else is a deliberate choice and is left alone.
+    static let retiredRewritePrompts = [
+        "Rewrite this transcript into clean, concise prose. Preserve meaning, names, technical terms, and the original language. Return only the rewritten text.",
+    ]
 
     /// The model a summary should actually use, resolving the "same as rewrite"
     /// default in one place instead of at every call site.
@@ -123,6 +149,10 @@ final class SettingsStore {
         /// forgotten.
         var vocabulary: [String] = []
 
+        /// Removes the sounds of speaking from dictated text. Meeting transcripts
+        /// are never touched: a meeting is a record of what was said.
+        var tidyDictation = true
+
         var historyRetention: HistoryRetention = .thirtyDays
         var meetingAudioRetention: MeetingAudioRetention = .keep
 
@@ -175,6 +205,7 @@ final class SettingsStore {
             meetingProfile = value(.meetingProfile, fallback.meetingProfile)
             localAI = value(.localAI, fallback.localAI)
             vocabulary = value(.vocabulary, fallback.vocabulary)
+            tidyDictation = value(.tidyDictation, fallback.tidyDictation)
             historyRetention = value(.historyRetention, fallback.historyRetention)
             meetingAudioRetention = value(.meetingAudioRetention, fallback.meetingAudioRetention)
             launchAtLogin = value(.launchAtLogin, fallback.launchAtLogin)
@@ -208,7 +239,7 @@ final class SettingsStore {
         self.defaults = defaults
         if let data = defaults.data(forKey: Key.payload),
            let decoded = try? JSONDecoder().decode(Payload.self, from: data) {
-            payload = Self.migratingVocabulary(decoded)
+            payload = Self.migrated(decoded)
         } else if let legacy = defaults.data(forKey: Key.legacyPayload),
                   var decoded = try? JSONDecoder().decode(Payload.self, from: legacy) {
             // v1 stored retention as a bare day count. Map it onto the closest
@@ -217,10 +248,24 @@ final class SettingsStore {
                 decoded.historyRetention = HistoryRetention(rawValue: days) ?? .thirtyDays
                 decoded.dictationRetentionDays = nil
             }
-            payload = Self.migratingVocabulary(decoded)
+            payload = Self.migrated(decoded)
         } else {
             payload = Payload()
         }
+    }
+
+    private static func migrated(_ payload: Payload) -> Payload {
+        migratingRewritePrompt(migratingVocabulary(payload))
+    }
+
+    /// Moves an untouched install onto the current rewrite instruction.
+    private static func migratingRewritePrompt(_ payload: Payload) -> Payload {
+        var migrated = payload
+        let stored = migrated.localAI.rewritePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if LocalAIConfiguration.retiredRewritePrompts.contains(stored) {
+            migrated.localAI.rewritePrompt = LocalAIConfiguration.defaultRewritePrompt
+        }
+        return migrated
     }
 
     /// Folds the two former per-workflow word lists into the single shared one.

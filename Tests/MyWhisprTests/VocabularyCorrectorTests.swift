@@ -102,7 +102,6 @@ struct VocabularyCorrectorTests {
     @Test("Tokenizing round-trips the original text exactly")
     func tokenizingIsLossless() {
         let text = "  Hello, world — it's 42 half-life…  "
-        let tokens = VocabularyCorrector.tokenize(text)
-        #expect(tokens.map(\.text).joined() == text)
+        #expect(WordTokens.join(WordTokens.split(text)) == text)
     }
 }

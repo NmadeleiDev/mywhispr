@@ -19,7 +19,15 @@ actor LocalAIService {
             text: text,
             timeout: configuration.rewriteTimeoutSeconds
         )
-        return Self.plainText(result, fallback: text)
+        let polished = Self.plainText(result, fallback: text)
+        // A polish that is much longer or much shorter than what went in is not a
+        // polish. The model paraphrased, answered a question it invented, or
+        // narrated what it was about to do — none of which the owner asked for, and
+        // all of which are better replaced by their own words.
+        guard Self.isPlausiblePolish(of: text, result: polished) else {
+            throw LocalAIError.rewriteDivergedFromSpeech
+        }
+        return polished
     }
 
     func summarize(_ transcript: String, configuration: LocalAIConfiguration) async throws -> String {
@@ -51,16 +59,53 @@ actor LocalAIService {
         guard loopback || configuration.allowLAN else { throw LocalAIError.nonLocalEndpoint }
     }
 
-    private static func plainText(_ value: String, fallback: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    static func plainText(_ value: String, fallback: String) -> String {
+        // Reasoning models emit their scratchpad before the answer. Left in, it would
+        // be typed straight into whatever app the owner was writing in.
+        var trimmed = value
+            .replacingOccurrences(
+                of: #"(?s)<(think|thinking|reasoning)>.*?</\1>"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return fallback }
+
         if trimmed.hasPrefix("```") {
-            return trimmed
+            trimmed = trimmed
                 .replacingOccurrences(of: #"^```[A-Za-z]*\s*"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: #"\s*```$"#, with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        return trimmed
+        // A model that wraps its answer in quotation marks did not mean them as part
+        // of the sentence. Curly quotes open and close with different characters, so
+        // the pairs are matched explicitly rather than by comparing the two ends.
+        let quotePairs: [(Character, Character)] = [
+            ("\"", "\""), ("'", "'"), ("\u{201C}", "\u{201D}"),
+            ("\u{2018}", "\u{2019}"), ("\u{00AB}", "\u{00BB}"),
+        ]
+        if trimmed.count > 1, let first = trimmed.first, let last = trimmed.last,
+           quotePairs.contains(where: { $0 == first && $1 == last }) {
+            trimmed = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    /// Whether a rewrite is close enough in size to be a tidy-up of the same speech.
+    ///
+    /// Length is a crude proxy for "same content", but it is the one signal available
+    /// without a second model, and it catches the failures that actually happen:
+    /// summarising, translating, and answering the dictation instead of cleaning it.
+    static func isPlausiblePolish(of original: String, result: String) -> Bool {
+        let before = original.trimmingCharacters(in: .whitespacesAndNewlines).count
+        let after = result.trimmingCharacters(in: .whitespacesAndNewlines).count
+        guard after > 0 else { return false }
+        guard before > 0 else { return true }
+        // Short dictations swing proportionally on a single word, so allow them an
+        // absolute allowance instead of a ratio.
+        if abs(after - before) <= 24 { return true }
+        let ratio = Double(after) / Double(before)
+        return ratio >= 0.5 && ratio <= 1.5
     }
 }
 
@@ -151,6 +196,7 @@ enum LocalAIError: LocalizedError {
     case nonLocalEndpoint
     case modelNotSelected
     case invalidResponse
+    case rewriteDivergedFromSpeech
 
     var errorDescription: String? {
         switch self {
@@ -158,6 +204,7 @@ enum LocalAIError: LocalizedError {
         case .nonLocalEndpoint: "Only loopback model servers are allowed unless LAN access is enabled."
         case .modelNotSelected: "Select a local language model first."
         case .invalidResponse: "The local model server returned an invalid response."
+        case .rewriteDivergedFromSpeech: "The local model rewrote the dictation instead of tidying it."
         }
     }
 }

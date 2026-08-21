@@ -202,6 +202,18 @@ struct DictationSettings: View {
             }
 
             Card(
+                title: "Tidying",
+                footnote: "Only deletes — it never rewrites a sentence or supplies a word you did not say. Meeting transcripts are left exactly as spoken."
+            ) {
+                SettingRow(
+                    label: "Drop filler sounds and false starts",
+                    detail: "“I don't want to re- rewrite it uh wholesale” becomes “I don't want to rewrite it wholesale”."
+                ) {
+                    Toggle("", isOn: $settings.payload.tidyDictation)
+                }
+            }
+
+            Card(
                 title: "Rewrite before inserting",
                 footnote: settings.payload.localAI.rewriteEnabled
                     ? "If the model is slow or unavailable, the faithful transcript is inserted instead. Your words are never lost to a failed rewrite."

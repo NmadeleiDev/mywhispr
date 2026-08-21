@@ -411,6 +411,16 @@ final class AppRuntime {
         phase = .idle
     }
 
+    /// Strips the noises of speaking from a dictation, if the owner wants that.
+    ///
+    /// The engine's untouched output is still what gets stored as the segment's
+    /// original text, so nothing said is actually lost — the detail view can show
+    /// what was really heard.
+    private func tidied(_ text: String) -> String {
+        guard settings.payload.tidyDictation else { return text }
+        return DisfluencyFilter.apply(to: text)
+    }
+
     /// Turns an engine's stage report into the phase the HUD renders.
     ///
     /// `span` exists because a meeting runs three jobs back to back — two
@@ -449,7 +459,7 @@ final class AppRuntime {
                     self?.report(stage, fraction, kind: .dictation)
                 }
             }
-            let faithful = TextCleaner.clean(result.text)
+            let faithful = TextCleaner.clean(tidied(result.text))
             var output = faithful
             if settings.payload.localAI.rewriteEnabled {
                 phase = .rewriting
@@ -804,7 +814,7 @@ final class AppRuntime {
                     self?.report(stage, fraction, kind: .dictation)
                 }
             }
-            let text = TextCleaner.clean(result.text)
+            let text = TextCleaner.clean(tidied(result.text))
             record.title = Self.summarise(text)
             record.state = .completed
             record.errorMessage = nil
