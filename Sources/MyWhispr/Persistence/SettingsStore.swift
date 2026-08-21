@@ -1,0 +1,277 @@
+import Foundation
+import Observation
+import OSLog
+import ServiceManagement
+
+struct LocalAIConfiguration: Codable, Equatable, Sendable {
+    enum Provider: String, Codable, CaseIterable, Sendable {
+        case ollama
+        case openAICompatible
+
+        var displayName: String {
+            switch self {
+            case .ollama: "Ollama"
+            case .openAICompatible: "OpenAI-compatible"
+            }
+        }
+
+        var defaultBaseURL: String {
+            switch self {
+            case .ollama: "http://127.0.0.1:11434"
+            case .openAICompatible: "http://127.0.0.1:1234/v1"
+            }
+        }
+    }
+
+    var provider: Provider = .ollama
+    var baseURL = "http://127.0.0.1:11434"
+    /// Model used to rewrite a dictation before insertion.
+    var model = ""
+    /// Model used for meeting summaries. Empty means "use the rewrite model", which
+    /// is the common case; a separate field lets a small fast model clean up
+    /// dictation while a larger one writes meeting notes.
+    var summaryModel = ""
+    var rewriteEnabled = false
+    var rewritePrompt = "Rewrite this transcript into clean, concise prose. Preserve meaning, names, technical terms, and the original language. Return only the rewritten text."
+    var summaryPrompt = "Create concise meeting notes with decisions and action items. Do not invent facts. Return Markdown."
+    /// Rewriting runs inside the gap between releasing the key and seeing text
+    /// appear, so it is bounded hard. Past this, the faithful transcript wins.
+    var rewriteTimeoutSeconds: Double = 4
+    var allowLAN = false
+
+    /// The model a summary should actually use, resolving the "same as rewrite"
+    /// default in one place instead of at every call site.
+    var effectiveSummaryModel: String {
+        summaryModel.isEmpty ? model : summaryModel
+    }
+}
+
+/// Where a dictation's text is allowed to live after it has been inserted.
+enum HistoryRetention: Int, Codable, CaseIterable, Sendable, Identifiable {
+    case none = 0
+    case sevenDays = 7
+    case thirtyDays = 30
+    case ninetyDays = 90
+    case forever = -1
+
+    var id: Int { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .none: "Don't keep"
+        case .sevenDays: "7 days"
+        case .thirtyDays: "30 days"
+        case .ninetyDays: "90 days"
+        case .forever: "Keep everything"
+        }
+    }
+
+    /// The instant before which dictations should be discarded, or nil when nothing
+    /// expires.
+    func cutoff(from now: Date = Date()) -> Date? {
+        switch self {
+        case .forever: nil
+        case .none: now
+        default: Calendar.current.date(byAdding: .day, value: -rawValue, to: now)
+        }
+    }
+}
+
+/// What happens to a meeting's two audio tracks once it has been transcribed.
+enum MeetingAudioRetention: String, Codable, CaseIterable, Sendable, Identifiable {
+    /// Keep audio so passages stay clickable and playback keeps working.
+    case keep
+    /// Discard audio after a successful transcript. Playback stops working; the
+    /// transcript and summary remain.
+    case discardAfterTranscription
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .keep: "Keep the recording"
+        case .discardAfterTranscription: "Delete after transcribing"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .keep: "Playback and click-to-hear stay available."
+        case .discardAfterTranscription: "Saves disk space. Playback is not available."
+        }
+    }
+}
+
+@MainActor
+@Observable
+final class SettingsStore {
+    private enum Key {
+        static let payload = "settings.payload.v2"
+        static let legacyPayload = "settings.payload.v1"
+    }
+
+    struct Payload: Codable, Equatable, Sendable {
+        var dictationProfile = TranscriptionProfile.dictationDefault
+        var meetingProfile = TranscriptionProfile.meetingDefault
+        var localAI = LocalAIConfiguration()
+
+        /// Names, jargon, and product names the owner wants spelled their way.
+        ///
+        /// One list for the whole app rather than one per workflow: it describes the
+        /// owner's world, not the job they happen to be doing, and splitting it means
+        /// adding a name twice and silently not having it work in whichever half was
+        /// forgotten.
+        var vocabulary: [String] = []
+
+        var historyRetention: HistoryRetention = .thirtyDays
+        var meetingAudioRetention: MeetingAudioRetention = .keep
+
+        var launchAtLogin = false
+        var playCues = true
+        var showHUD = true
+        var showDockIcon = false
+        /// The owner has been through the setup journey at least once. Suppresses
+        /// the automatic setup window on later launches even if a permission is
+        /// later revoked — the menu bar surfaces that case instead.
+        var hasCompletedSetup = false
+
+        var pushToTalkKey: PushToTalkKey = .rightCommand
+        var pushToTalkEnabled = true
+        var meetingShortcut = ShortcutBinding.meetingToggle
+        var quickPasteShortcut = ShortcutBinding.quickPaste
+        var openWindowShortcut = ShortcutBinding.openMainWindow
+        var quickPasteEnabled = true
+
+        /// Discards takes shorter than this, which is what an accidental brush
+        /// against the talk key produces.
+        var minimumDictationSeconds: Double = 0.35
+        /// Hard ceiling on a single dictation, so a key stuck down by a wedged app
+        /// cannot record until the disk fills.
+        var maximumDictationSeconds: Double = 300
+
+        // Legacy field kept for decoding v1 payloads; migrated in `init`.
+        var dictationRetentionDays: Int?
+
+        init() {}
+
+        /// Decoded key by key against a fresh payload's defaults.
+        ///
+        /// Swift's synthesized decoder does *not* fall back to a property's default
+        /// when its key is absent — it throws. With the synthesized version, adding
+        /// any new setting made every previously stored payload undecodable, and the
+        /// store's `else` branch then quietly handed back factory defaults: one app
+        /// update and the owner's shortcuts, model choices and retention policy were
+        /// gone with no error anywhere. Settings have to survive their own schema
+        /// changing, so every key is optional on the way in.
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let fallback = Payload()
+
+            func value<T: Decodable>(_ key: CodingKeys, _ default: T) -> T {
+                (try? container.decodeIfPresent(T.self, forKey: key)) .flatMap { $0 } ?? `default`
+            }
+
+            dictationProfile = value(.dictationProfile, fallback.dictationProfile)
+            meetingProfile = value(.meetingProfile, fallback.meetingProfile)
+            localAI = value(.localAI, fallback.localAI)
+            vocabulary = value(.vocabulary, fallback.vocabulary)
+            historyRetention = value(.historyRetention, fallback.historyRetention)
+            meetingAudioRetention = value(.meetingAudioRetention, fallback.meetingAudioRetention)
+            launchAtLogin = value(.launchAtLogin, fallback.launchAtLogin)
+            playCues = value(.playCues, fallback.playCues)
+            showHUD = value(.showHUD, fallback.showHUD)
+            showDockIcon = value(.showDockIcon, fallback.showDockIcon)
+            hasCompletedSetup = value(.hasCompletedSetup, fallback.hasCompletedSetup)
+            pushToTalkKey = value(.pushToTalkKey, fallback.pushToTalkKey)
+            pushToTalkEnabled = value(.pushToTalkEnabled, fallback.pushToTalkEnabled)
+            meetingShortcut = value(.meetingShortcut, fallback.meetingShortcut)
+            quickPasteShortcut = value(.quickPasteShortcut, fallback.quickPasteShortcut)
+            openWindowShortcut = value(.openWindowShortcut, fallback.openWindowShortcut)
+            quickPasteEnabled = value(.quickPasteEnabled, fallback.quickPasteEnabled)
+            minimumDictationSeconds = value(.minimumDictationSeconds, fallback.minimumDictationSeconds)
+            maximumDictationSeconds = value(.maximumDictationSeconds, fallback.maximumDictationSeconds)
+            dictationRetentionDays = try? container.decodeIfPresent(Int.self, forKey: .dictationRetentionDays)
+        }
+    }
+
+    var payload: Payload {
+        didSet {
+            guard payload != oldValue else { return }
+            save()
+        }
+    }
+
+    private let defaults: UserDefaults
+    private let logger = Logger(subsystem: "app.mywhispr.mac", category: "settings")
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let data = defaults.data(forKey: Key.payload),
+           let decoded = try? JSONDecoder().decode(Payload.self, from: data) {
+            payload = Self.migratingVocabulary(decoded)
+        } else if let legacy = defaults.data(forKey: Key.legacyPayload),
+                  var decoded = try? JSONDecoder().decode(Payload.self, from: legacy) {
+            // v1 stored retention as a bare day count. Map it onto the closest
+            // named option so an existing install does not silently change policy.
+            if let days = decoded.dictationRetentionDays {
+                decoded.historyRetention = HistoryRetention(rawValue: days) ?? .thirtyDays
+                decoded.dictationRetentionDays = nil
+            }
+            payload = Self.migratingVocabulary(decoded)
+        } else {
+            payload = Payload()
+        }
+    }
+
+    /// Folds the two former per-workflow word lists into the single shared one.
+    ///
+    /// Runs against the current payload as well as the legacy one, because the
+    /// split lists shipped in v2 and an existing install has them under the same key.
+    private static func migratingVocabulary(_ payload: Payload) -> Payload {
+        var migrated = payload
+        let inherited = (migrated.dictationProfile.legacyVocabulary ?? [])
+            + (migrated.meetingProfile.legacyVocabulary ?? [])
+        migrated.dictationProfile.legacyVocabulary = nil
+        migrated.meetingProfile.legacyVocabulary = nil
+        guard !inherited.isEmpty else { return migrated }
+
+        var seen = Set(migrated.vocabulary.map { $0.lowercased() })
+        for entry in inherited {
+            let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed.lowercased()).inserted else { continue }
+            migrated.vocabulary.append(trimmed)
+        }
+        return migrated
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) throws {
+        if enabled {
+            try SMAppService.mainApp.register()
+        } else {
+            try SMAppService.mainApp.unregister()
+        }
+        payload.launchAtLogin = enabled
+    }
+
+    /// Reconciles the stored preference with what the system actually reports, so a
+    /// login item removed in System Settings does not leave a lying checkbox.
+    func refreshLaunchAtLoginStatus() {
+        payload.launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
+    func resetShortcuts() {
+        payload.pushToTalkKey = .rightCommand
+        payload.pushToTalkEnabled = true
+        payload.meetingShortcut = .meetingToggle
+        payload.quickPasteShortcut = .quickPaste
+        payload.openWindowShortcut = .openMainWindow
+    }
+
+    private func save() {
+        do {
+            defaults.set(try JSONEncoder().encode(payload), forKey: Key.payload)
+        } catch {
+            logger.error("Settings could not be saved: \(error.localizedDescription)")
+        }
+    }
+}

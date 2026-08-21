@@ -1,0 +1,6 @@
+MyWhispr includes FluidAudio (Apache-2.0), Argmax OSS Swift / WhisperKit (MIT),
+and GRDB.swift (MIT). Model-specific attribution and license information is
+shown before each model download and in MyWhispr Settings.
+
+The Core Audio system-tap lifecycle is adapted from OpenWhispr under the MIT
+License. Copyright (c) 2024 OpenWhispr Team.
