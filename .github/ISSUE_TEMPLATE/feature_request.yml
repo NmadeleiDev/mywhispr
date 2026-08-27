@@ -1,0 +1,64 @@
+name: Feature request
+description: Propose an improvement grounded in a concrete user need.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before the implementation. MyWhispr's core contract is native, private, local-first speech-to-text without accounts, subscriptions, telemetry, or artificial limits.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Dictation and insertion
+        - Meetings
+        - History and search
+        - Local AI
+        - Models and languages
+        - Command-line interface
+        - Privacy and storage
+        - Build, packaging, or documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or job to be done
+      description: Who needs this, what are they trying to accomplish, and where does the current experience fail?
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and what success looks like. A proposed implementation is welcome but not required.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain current workarounds or related tools, if any.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add sanitized mockups, examples, compatibility constraints, or links.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this request.
+          required: true
+        - label: This request preserves or explicitly discusses MyWhispr's local-first privacy contract.
+          required: true

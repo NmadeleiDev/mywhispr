@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    name: Test and build (macOS 26)
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build and verify app bundle
+        env:
+          CODESIGN_IDENTITY: '-'
+        run: ./scripts/build-app.sh
+
+      - name: Smoke-test packaged CLI
+        run: |
+          test "$(dist/MyWhispr.app/Contents/MacOS/MyWhispr --version)" = "MyWhispr 0.1.0"
+          dist/MyWhispr.app/Contents/MacOS/MyWhispr --help | grep -F "MyWhispr transcribe <audio-file>"

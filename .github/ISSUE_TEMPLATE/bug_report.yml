@@ -1,0 +1,88 @@
+name: Bug report
+description: Report reproducible behavior that is broken or incorrect.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve MyWhispr. Search existing issues first and remove private transcript, recording, path, and model-server data before submitting. Report security issues privately through SECURITY.md.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Dictation and insertion
+        - Meeting recording
+        - Transcription or diarization
+        - History, search, editing, or playback
+        - Local AI
+        - Models and downloads
+        - Command-line interface
+        - Build or installation
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: MyWhispr version or commit
+      description: Run `mywhispr --version` and include the Git commit when building from source.
+      placeholder: "0.1.0 / 10b3634"
+    validations:
+      required: true
+
+  - type: input
+    id: system
+    attributes:
+      label: Mac and macOS version
+      placeholder: "MacBook Pro M4, macOS 26.6"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Give the shortest reliable sequence, including relevant engine, model, language, permissions, input format, and local-AI server.
+      placeholder: |
+        1. Open …
+        2. Configure …
+        3. Hold or click …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or screenshots
+      description: Attach sanitized evidence if useful. Never upload sensitive recordings, transcripts, credentials, or personal paths.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed private speech, transcript, credential, and file-path data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
