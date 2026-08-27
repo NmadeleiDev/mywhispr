@@ -11,10 +11,22 @@ import Foundation
 /// means the call the owner is recording.
 ///
 /// So the realtime side only hands a buffer over, and the writing happens here.
+///
+/// The file's format is taken from the first buffer handed over rather than
+/// declared up front. A capture's format is not knowable before the capture runs:
+/// an input bus renegotiates with the hardware as devices come and go, so a format
+/// read a few lines earlier can already be wrong by the time audio arrives, and a
+/// file opened against the wrong one rejects every buffer written to it. Owning
+/// that decision here, from the audio itself, is what makes the two agree by
+/// construction.
 final class AudioFileWriter: @unchecked Sendable {
     private let queue: DispatchQueue
     private let lock = NSLock()
-    private let file: AVAudioFile
+    private let url: URL
+    /// Used only if the take ends without a single buffer, so that a silent
+    /// recording is still a readable empty file rather than a missing one.
+    private let fallbackSettings: [String: Any]
+    private var file: AVAudioFile?
     private var isClosed = false
     private var failure: (any Error)?
 
@@ -23,7 +35,8 @@ final class AudioFileWriter: @unchecked Sendable {
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        file = try AVAudioFile(forWriting: url, settings: settings)
+        self.url = url
+        self.fallbackSettings = settings
         queue = DispatchQueue(label: label, qos: .utility)
     }
 
@@ -60,7 +73,10 @@ final class AudioFileWriter: @unchecked Sendable {
             defer { lock.unlock() }
             guard !isClosed else { return }
             do {
-                try file.write(from: payload.value)
+                let buffer = payload.value
+                let target = try file ?? AVAudioFile(forWriting: url, settings: buffer.format.settings)
+                file = target
+                try target.write(from: buffer)
             } catch {
                 failure = failure ?? error
                 isClosed = true
@@ -75,8 +91,16 @@ final class AudioFileWriter: @unchecked Sendable {
     func finish() {
         queue.sync {
             lock.lock()
+            defer { lock.unlock() }
+            guard !isClosed else { return }
             isClosed = true
-            lock.unlock()
+            // Nothing ever arrived — a muted input, a device that never delivered,
+            // a meeting with silence on one track. Callers downstream are entitled
+            // to a file at the path they were given; "no speech in it" is an outcome
+            // they already handle, "it is not there" is not.
+            if file == nil {
+                file = try? AVAudioFile(forWriting: url, settings: fallbackSettings)
+            }
         }
     }
 

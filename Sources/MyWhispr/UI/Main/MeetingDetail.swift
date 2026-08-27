@@ -15,8 +15,84 @@ struct MeetingDetail: View {
     @State private var summaryDraft = ""
     @State private var editingSummary = false
     @State private var confirmingDelete = false
+    @State private var mode: Mode = .transcript
+
+    /// The two things an owner does with a finished meeting: read it, or ask about
+    /// it. They are alternatives rather than neighbours — each wants the whole
+    /// surface and its own scroll position — so they are a switch, not two panes.
+    private enum Mode: String, CaseIterable, Identifiable {
+        case transcript
+        case ask
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .transcript: "Transcript"
+            case .ask: "Ask"
+            }
+        }
+    }
+
+    /// Asking is only offered once there is something to ask about.
+    private var canAsk: Bool {
+        detail.session.state == .completed && !detail.segments.isEmpty
+    }
 
     var body: some View {
+        Group {
+            if mode == .ask, canAsk {
+                MeetingChatView(chat: runtime.chat, runtime: runtime)
+            } else {
+                transcriptSurface
+            }
+        }
+        .safeAreaInset(edge: .top, spacing: 0) { titleBar }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if mode == .ask, canAsk {
+                MeetingChatComposer(chat: runtime.chat, runtime: runtime)
+            } else {
+                actionBar
+            }
+        }
+        .task(id: detail.session.id) {
+            titleDraft = detail.session.title
+            summaryDraft = detail.session.summary ?? ""
+            editingSummary = false
+            mode = .transcript
+        }
+        .onChange(of: canAsk) { _, possible in
+            if !possible { mode = .transcript }
+        }
+        .alert("Rename speaker", isPresented: Binding(
+            get: { renamingSpeaker != nil },
+            set: { if !$0 { renamingSpeaker = nil } }
+        )) {
+            TextField("Name", text: $speakerDraft)
+            Button("Cancel", role: .cancel) { renamingSpeaker = nil }
+            Button("Rename") {
+                if let original = renamingSpeaker {
+                    runtime.renameSpeaker(from: original, to: speakerDraft, in: detail.session.id)
+                }
+                renamingSpeaker = nil
+            }
+        } message: {
+            Text("Every passage spoken by this person is renamed.")
+        }
+        .confirmationDialog(
+            "Delete this meeting?",
+            isPresented: $confirmingDelete,
+            titleVisibility: .visible
+        ) {
+            Button("Delete meeting and recording", role: .destructive) {
+                runtime.deleteSession(id: detail.session.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The transcript, the summary, and both audio tracks are removed from this Mac. This cannot be undone.")
+        }
+    }
+
+    private var transcriptSurface: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -66,40 +142,6 @@ struct MeetingDetail: View {
             }
         }
         .scrollEdgeEffectStyle(.soft, for: .top)
-        .safeAreaInset(edge: .top, spacing: 0) { titleBar }
-        .safeAreaInset(edge: .bottom, spacing: 0) { actionBar }
-        .task(id: detail.session.id) {
-            titleDraft = detail.session.title
-            summaryDraft = detail.session.summary ?? ""
-            editingSummary = false
-        }
-        .alert("Rename speaker", isPresented: Binding(
-            get: { renamingSpeaker != nil },
-            set: { if !$0 { renamingSpeaker = nil } }
-        )) {
-            TextField("Name", text: $speakerDraft)
-            Button("Cancel", role: .cancel) { renamingSpeaker = nil }
-            Button("Rename") {
-                if let original = renamingSpeaker {
-                    runtime.renameSpeaker(from: original, to: speakerDraft, in: detail.session.id)
-                }
-                renamingSpeaker = nil
-            }
-        } message: {
-            Text("Every passage spoken by this person is renamed.")
-        }
-        .confirmationDialog(
-            "Delete this meeting?",
-            isPresented: $confirmingDelete,
-            titleVisibility: .visible
-        ) {
-            Button("Delete meeting and recording", role: .destructive) {
-                runtime.deleteSession(id: detail.session.id)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The transcript, the summary, and both audio tracks are removed from this Mac. This cannot be undone.")
-        }
     }
 
     /// The meeting's name, editable in place. Renaming is the most common thing an
@@ -111,9 +153,20 @@ struct MeetingDetail: View {
                 .font(.system(size: 14, weight: .semibold))
                 .onSubmit { runtime.renameSession(id: detail.session.id, title: titleDraft) }
             Spacer(minLength: 8)
+            if canAsk {
+                Picker("", selection: $mode) {
+                    ForEach(Mode.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
+                .fixedSize()
+            }
             Text(detail.session.startedAt.formatted(date: .abbreviated, time: .shortened))
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .layoutPriority(-1)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 10)
@@ -142,21 +195,19 @@ struct MeetingDetail: View {
                     }
                     .buttonStyle(.glass)
                     .controlSize(.small)
-                    .disabled(!runtime.canUseLocalAI)
+                    .disabled(!runtime.canAskLocalAI)
                     .help(
-                        runtime.canUseLocalAI
+                        runtime.canAskLocalAI
                             ? "Write meeting notes with your local AI model"
                             : "Connect a local AI service in Settings to summarize"
                     )
                 }
 
-                Button {
-                    runtime.copy(detail.transcript, note: "Transcript copied.")
-                } label: {
-                    Label("Copy transcript", systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.glass)
-                .controlSize(.small)
+                ConfirmingButton(
+                    title: "Copy transcript",
+                    systemImage: "doc.on.doc",
+                    confirmation: "Transcript copied"
+                ) { runtime.copy(detail.transcript, note: "Transcript copied.") }
             }
 
             if detail.session.state == .failed || detail.session.state == .interrupted {
@@ -296,11 +347,11 @@ struct MeetingDetail: View {
             } else if let summary = detail.session.summary {
                 VStack(alignment: .leading, spacing: 10) {
                     // Markdown is what the summary prompt asks the model for, so it is
-                    // rendered rather than shown as raw asterisks.
-                    Text(LocalizedStringKey(summary))
-                        .font(.system(size: 13))
+                    // rendered rather than shown as raw asterisks. `Text` alone only
+                    // covers the inline half of Markdown; the headings and bullets a
+                    // model writes notes with are block-level and printed literally.
+                    MarkdownText(markdown: summary)
                         .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     HStack(spacing: 8) {
                         Button("Edit") {
                             summaryDraft = summary
@@ -308,9 +359,11 @@ struct MeetingDetail: View {
                         }
                         .buttonStyle(.glass)
                         .controlSize(.small)
-                        Button("Copy") { runtime.copy(summary, note: "Summary copied.") }
-                            .buttonStyle(.glass)
-                            .controlSize(.small)
+                        ConfirmingButton(
+                            title: "Copy",
+                            systemImage: "doc.on.doc",
+                            confirmation: "Copied"
+                        ) { runtime.copy(summary, note: "Summary copied.") }
                     }
                 }
             }

@@ -81,7 +81,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@main
 struct MyWhisprApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @State private var bootstrap = AppBootstrap.shared

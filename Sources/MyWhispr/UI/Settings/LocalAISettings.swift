@@ -9,7 +9,7 @@ struct LocalAISettings: View {
         SettingsPane {
             Card(
                 title: "Connection",
-                footnote: "MyWhispr never transcribes through this service. It only sends a finished transcript and your instruction, and only when you have turned rewriting on or asked for a summary."
+                footnote: "MyWhispr never transcribes through this service. It only sends a finished transcript and your instruction, and only when you have turned rewriting on, asked for a summary, or asked a question about a meeting."
             ) {
                 SettingRow(label: "Service") {
                     Picker("", selection: Binding(
@@ -74,10 +74,45 @@ struct LocalAISettings: View {
                     modelPicker(selection: $settings.payload.localAI.model, allowsInherit: false)
                 }
                 SettingRow(
-                    label: "Summarize meetings with",
-                    detail: "Runs only when you ask, so a slower, stronger model is fine."
+                    label: "Summarize and answer with",
+                    detail: "Used for meeting summaries and for questions about a meeting. Runs only when you ask, so a slower, stronger model is fine."
                 ) {
                     modelPicker(selection: $settings.payload.localAI.summaryModel, allowsInherit: true)
+                }
+            }
+
+            Card(
+                title: "Reading a whole meeting",
+                footnote: "A question about a meeting is answered from the entire transcript, so the model has to be able to hold it. Roughly: 8K is half an hour of speech, 32K is two hours. A larger window costs memory while the model is loaded, and a window too small for the meeting is filled from the end — the model answers about the part it saw without saying so.\n\nOllama is told this per request. An OpenAI-compatible server sets its own window when it loads a model, so this is only used to warn you when a meeting will not fit."
+            ) {
+                SettingRow(
+                    label: "Context limit",
+                    detail: "The largest window MyWhispr will ask for."
+                ) {
+                    Picker("", selection: $settings.payload.localAI.maxContextTokens) {
+                        ForEach(LocalAIConfiguration.contextChoices, id: \.self) { limit in
+                            Text(TokenBudget.describe(limit)).tag(limit)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: 120)
+                }
+            }
+
+            Card(title: "Question instruction") {
+                TextEditor(text: $settings.payload.localAI.chatPrompt)
+                    .font(.system(size: 12))
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 110)
+                    .padding(8)
+                    .background(.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                HStack {
+                    Spacer()
+                    Button("Restore default") {
+                        settings.payload.localAI.chatPrompt = LocalAIConfiguration.defaultChatPrompt
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
                 }
             }
 
@@ -166,7 +201,7 @@ struct PrivacySettings: View {
                 SettingRow(label: "Speech transcription") {
                     StatusPill(tone: .good, label: "On this Mac")
                 }
-                SettingRow(label: "Rewrites and summaries") {
+                SettingRow(label: "Rewrites, summaries, and questions") {
                     StatusPill(
                         tone: runtime.settings.payload.localAI.allowLAN ? .unknown : .good,
                         label: runtime.settings.payload.localAI.allowLAN

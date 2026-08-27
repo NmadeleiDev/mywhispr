@@ -55,6 +55,13 @@ actor WhisperKitEngine: TranscriptionEngine {
         let options = DecodingOptions(
             language: language,
             detectLanguage: language == nil,
+            // Off by default in WhisperKit, and the default is wrong for a
+            // transcript: it leaves `<|startoftranscript|>`, the language tag, and a
+            // `<|9.36|>` at every segment boundary sitting in the text. The segment
+            // timings are carried in `TranscriptSegment` already, so the copies
+            // inside the sentences are nothing but noise the owner would have to
+            // delete by hand.
+            skipSpecialTokens: true,
             wordTimestamps: true,
             chunkingStrategy: .vad
         )
@@ -77,13 +84,15 @@ actor WhisperKitEngine: TranscriptionEngine {
                 id: UUID(),
                 start: TimeInterval(segment.start),
                 end: TimeInterval(segment.end),
-                text: segment.text.trimmingCharacters(in: .whitespacesAndNewlines),
+                text: WhisperMarkup.stripped(segment.text),
                 speaker: channel == .microphone ? "You" : "Speaker 1",
                 channel: channel
             )
         }.filter { !$0.text.isEmpty }
-        let text = results.map(\.text).joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Stripped again here, and in the segments above, because the decoding option
+        // is one library default away from putting model markup into the owner's
+        // stored transcript, and that has already happened once.
+        let text = WhisperMarkup.stripped(results.map(\.text).joined(separator: " "))
         guard !text.isEmpty else { throw TranscriptionEngineError.noSpeech }
         progress?(.running, 1)
         return TranscriptionResult(

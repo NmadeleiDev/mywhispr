@@ -28,14 +28,25 @@ are transcribed after the meeting with speaker separation.
 - **Recent dictations:** Option–Command–V summons a palette of what was said
   recently and inserts the chosen line at the cursor. Control–Option–Command–O
   opens the main window.
-- **Local AI (optional):** faithful speech-to-text is the default. Rewriting and
-  meeting summaries can use Ollama or a loopback OpenAI-compatible endpoint.
-  LAN endpoints require a separate explicit setting.
+- **Ask a meeting questions:** a finished meeting has a Transcript / Ask switch.
+  Ask sends the whole transcript — with speakers and timestamps — to your local
+  model and answers from it, as a conversation that is kept with the meeting.
+  Answers stream as they are written and can be stopped, keeping what arrived.
+  Because the model must hold the entire meeting, MyWhispr asks Ollama for a
+  context window large enough for it, up to a ceiling you set; when a meeting
+  will not fit, it says so instead of letting the server silently drop the
+  beginning.
+- **Local AI (optional):** faithful speech-to-text is the default. Rewriting,
+  meeting summaries, and meeting questions can use Ollama or a loopback
+  OpenAI-compatible endpoint. LAN endpoints require a separate explicit setting.
 
 Failed dictation audio is retained for 24 hours for recovery. Completed
 dictation audio is removed immediately; dictation text retention defaults to
-30 days. Meeting tracks, transcripts, edits, titles, and summaries remain in
-`~/Library/Application Support/MyWhispr` until deleted in the app.
+30 days. Meeting tracks, transcripts, edits, titles, summaries, and the
+questions asked about a meeting remain in `~/Library/Application
+Support/MyWhispr` until deleted in the app. Questions are deleted with their
+meeting and are not part of the search index — searching meetings searches what
+was said, not what you asked.
 
 ## Requirements
 
@@ -45,7 +56,9 @@ dictation audio is removed immediately; dictation text retention defaults to
   required: Accessibility alone authorises the event tap that watches the
   dictation key. Meetings additionally need System Audio Recording.
 - Optional: Ollama, LM Studio, or another local OpenAI-compatible server for
-  rewriting and on-demand meeting summaries
+  rewriting, meeting summaries, and questions about a meeting. Answering
+  questions loads the whole transcript, so a model with a large context window
+  is worth having: roughly 8K tokens per half hour of speech.
 
 ## Build
 
@@ -54,6 +67,34 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ./scripts/build-app.sh
 open dist/MyWhispr.app
 ```
+
+## Command line
+
+The same executable can transcribe an existing audio file without launching the
+menu-bar application. WAV, CAF, AIFF, MP3, M4A, FLAC, and Ogg-family inputs are
+decoded locally; `.ogg` may contain Vorbis, Opus, or FLAC audio.
+
+```sh
+# Install or update the global user-level command in ~/.local/bin.
+./scripts/install-cli.sh
+
+# Fast default model; prints only the transcript to stdout.
+mywhispr transcribe recording.ogg
+
+# A specific multilingual WhisperKit model with structured output.
+mywhispr recording.m4a --model small --language auto --format json
+
+# The packaged app exposes the identical command.
+dist/MyWhispr.app/Contents/MacOS/MyWhispr transcribe recording.ogg
+```
+
+On success the command writes only the transcript to stdout (or the requested
+JSON document), with no progress output, so it can be used directly in scripts.
+Errors go to stderr and return a nonzero exit status. Run `mywhispr --help` for
+every engine, model, and output option. Models are downloaded on first use
+exactly as they are in the app. The installer copies a fresh release build rather
+than linking into `.build`, so `swift package clean` does not break the global
+command; rerun it whenever MyWhispr is updated.
 
 `DEVELOPER_DIR` is needed when `xcode-select` points at the Command Line Tools,
 whose Swift driver does not find the bundled `Testing` framework.

@@ -34,10 +34,71 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
     var rewriteEnabled = false
     var rewritePrompt = LocalAIConfiguration.defaultRewritePrompt
     var summaryPrompt = "Create concise meeting notes with decisions and action items. Do not invent facts. Return Markdown."
+    /// What the model is told before a question about a meeting.
+    var chatPrompt = LocalAIConfiguration.defaultChatPrompt
     /// Rewriting runs inside the gap between releasing the key and seeing text
     /// appear, so it is bounded hard. Past this, the faithful transcript wins.
     var rewriteTimeoutSeconds: Double = 4
     var allowLAN = false
+    /// The largest context window MyWhispr will ask a server to load.
+    ///
+    /// A meeting is asked about in full, so the window has to hold the whole
+    /// transcript — but the window is memory, and a ceiling the owner controls is
+    /// the difference between "the model read all of it" and a machine that swaps
+    /// itself to a standstill. 32K holds roughly two hours of speech.
+    var maxContextTokens = 32_768
+
+    /// Decoded key by key, for the same reason ``SettingsStore/Payload`` is.
+    ///
+    /// The synthesized decoder throws when a key is absent, and the payload above
+    /// catches that with `try?` — so adding a single field here would have silently
+    /// reset the endpoint, the chosen models and the owner's edited prompts to
+    /// factory defaults on the next launch, with nothing reported anywhere.
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let fallback = LocalAIConfiguration()
+
+        func value<T: Decodable>(_ key: CodingKeys, _ default: T) -> T {
+            (try? container.decodeIfPresent(T.self, forKey: key)).flatMap { $0 } ?? `default`
+        }
+
+        provider = value(.provider, fallback.provider)
+        baseURL = value(.baseURL, fallback.baseURL)
+        model = value(.model, fallback.model)
+        summaryModel = value(.summaryModel, fallback.summaryModel)
+        rewriteEnabled = value(.rewriteEnabled, fallback.rewriteEnabled)
+        rewritePrompt = value(.rewritePrompt, fallback.rewritePrompt)
+        summaryPrompt = value(.summaryPrompt, fallback.summaryPrompt)
+        chatPrompt = value(.chatPrompt, fallback.chatPrompt)
+        rewriteTimeoutSeconds = value(.rewriteTimeoutSeconds, fallback.rewriteTimeoutSeconds)
+        allowLAN = value(.allowLAN, fallback.allowLAN)
+        maxContextTokens = value(.maxContextTokens, fallback.maxContextTokens)
+    }
+
+    init() {}
+
+    /// Ceilings offered in Settings, with roughly how much meeting each holds.
+    static let contextChoices = [8_192, 16_384, 32_768, 65_536, 131_072]
+
+    /// Answering questions about a meeting, not summarising one.
+    ///
+    /// The instruction that matters is the refusal: a model given a transcript and a
+    /// question it cannot answer from that transcript will answer anyway, from what
+    /// meetings usually contain. An invented decision read back in the owner's own
+    /// meeting is worse than no answer at all, so "say you don't know" is stated
+    /// before anything else.
+    static let defaultChatPrompt = """
+    You answer questions about a meeting, using the transcript below as your only \
+    source.
+
+    Answer from the transcript alone. If it does not contain the answer, say so \
+    plainly rather than guessing or filling the gap with what usually happens in \
+    meetings. Never invent a decision, a name, a number or a commitment.
+
+    Cite the timestamp in square brackets when you point at something specific, and \
+    quote the speaker's own words when the wording matters. Be brief unless asked \
+    for detail. Answer in the language of the question. Format with Markdown.
+    """
 
     /// Polish, not rewriting.
     ///

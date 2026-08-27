@@ -223,12 +223,57 @@ struct TranscriptSegmentRecord: Codable, FetchableRecord, PersistableRecord, Ide
     var editedText: String
 }
 
+/// One turn of a conversation about a meeting.
+///
+/// Stored beside the transcript rather than held in memory, because a question worth
+/// asking is worth still having an answer to tomorrow — and because re-asking it
+/// means the model reads the whole meeting again.
+struct ChatMessageRecord: Codable, FetchableRecord, PersistableRecord, Identifiable, Equatable, Sendable {
+    static let databaseTableName = "chatMessages"
+
+    var id: UUID
+    var sessionID: UUID
+    var position: Int
+    /// Only ever `user` or `assistant`. The system message is derived from the
+    /// transcript and the owner's instruction at the moment of asking, so storing it
+    /// would freeze a copy of both.
+    var role: LocalAIMessage.Role
+    var content: String
+    var createdAt: Date
+}
+
+extension LocalAIMessage.Role: DatabaseValueConvertible {}
+
 struct SessionDetail: Sendable {
     var session: SessionRecord
     var segments: [TranscriptSegmentRecord]
 
     var transcript: String {
         segments.map(\.editedText).joined(separator: " ")
+    }
+
+    /// The transcript written out the way it is read on screen: who spoke, when, and
+    /// what they said.
+    ///
+    /// This is the form given to a language model. The flat `transcript` above throws
+    /// away both facts a meeting turns on — a model reading it cannot answer "who
+    /// said that" or "when did we get to pricing", and will cheerfully invent both.
+    /// Consecutive lines from one speaker are joined into a single turn, which is how
+    /// a person reads them and costs a fraction of the tokens.
+    var annotatedTranscript: String {
+        var turns: [String] = []
+        var currentSpeaker: String?
+        for segment in segments {
+            let text = segment.editedText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            if segment.speaker == currentSpeaker, let previous = turns.popLast() {
+                turns.append(previous + " " + text)
+            } else {
+                turns.append("[\(Clock.string(segment.start))] \(segment.speaker): \(text)")
+                currentSpeaker = segment.speaker
+            }
+        }
+        return turns.joined(separator: "\n")
     }
 }
 

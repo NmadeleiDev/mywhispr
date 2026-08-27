@@ -7,7 +7,9 @@ enum HUDState: Equatable {
     case armed                              // key is down, capture is spinning up
     case listening(startedAt: Date)         // dictation, live
     case meeting(startedAt: Date, collapsed: Bool)
-    case working(WorkStage, progress: Double?)
+    /// The workflow is carried because what cancelling costs depends on it, and
+    /// the pill is where cancelling is offered.
+    case working(WorkflowKind, WorkStage, progress: Double?)
     case inserted(words: Int)
     case copied(reason: CopyReason)
     case failed(String)
@@ -63,6 +65,9 @@ struct RecordingHUD: View {
 
     @Namespace private var glass
     @State private var now = Date()
+    /// Set by the first click on a meeting's stop control, cleared by the second or
+    /// by the timeout below.
+    @State private var confirmingDiscard = false
 
     private let tick = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
 
@@ -93,6 +98,11 @@ struct RecordingHUD: View {
                 Text("Listening")
                     .foregroundStyle(.secondary)
             }
+            // Cancellable for the same reason the live pill is, and for one more: if
+            // capture never starts, this is the state that would otherwise have to be
+            // waited out. The runtime puts a deadline on that; a click is faster.
+            .onTapGesture(perform: onCancel)
+            .help("Click to cancel")
 
         case .listening(let startedAt):
             let elapsed = now.timeIntervalSince(startedAt)
@@ -142,7 +152,7 @@ struct RecordingHUD: View {
                 }
             }
 
-        case .working(let stage, let progress):
+        case .working(let kind, let stage, let progress):
             content(tint: nil) {
                 WorkIndicator(progress: progress)
                 Text(stage.label)
@@ -157,15 +167,14 @@ struct RecordingHUD: View {
                 // Waiting is the one part of dictation the owner cannot shorten, so
                 // there is always a way out of it. Kept quiet — it is an escape
                 // hatch, not the expected next step.
-                Button(action: onCancelProcessing) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 18, height: 18)
-                        .contentShape(.circle)
-                }
-                .buttonStyle(.plain)
-                .help("Stop")
+                //
+                // A meeting asks first. Cancelling a dictation forfeits a sentence
+                // that can be said again; cancelling a meeting forfeits the only
+                // transcription pass over an hour of audio, from a control that has
+                // been sitting under the pointer at the bottom of the screen for
+                // however long the pass has been running. One stray click should not
+                // be able to spend that.
+                stopControl(kind: kind)
             }
 
         case .inserted(let words):
@@ -202,6 +211,41 @@ struct RecordingHUD: View {
                     .lineLimit(1)
                     .frame(maxWidth: 320, alignment: .leading)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func stopControl(kind: WorkflowKind) -> some View {
+        let needsConfirmation = kind == .meeting && !confirmingDiscard
+        Button {
+            if needsConfirmation {
+                confirmingDiscard = true
+            } else {
+                confirmingDiscard = false
+                onCancelProcessing()
+            }
+        } label: {
+            if confirmingDiscard {
+                Text("Discard?")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Palette.danger)
+                    .padding(.horizontal, 4)
+            } else {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 18, height: 18)
+                    .contentShape(.circle)
+            }
+        }
+        .buttonStyle(.plain)
+        .help(confirmingDiscard ? "Discard this transcription" : "Stop")
+        // The question expires rather than latching: an unanswered "Discard?" left on
+        // screen would become the one-click destructive button it exists to prevent.
+        .task(id: confirmingDiscard) {
+            guard confirmingDiscard else { return }
+            try? await Task.sleep(for: .seconds(5))
+            confirmingDiscard = false
         }
     }
 

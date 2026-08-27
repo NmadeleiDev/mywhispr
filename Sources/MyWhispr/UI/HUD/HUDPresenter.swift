@@ -68,21 +68,23 @@ final class HUDPresenter {
         case .stopping:
             cancelDismiss()
 
-        case .preparingModel(_, let isDownloading, let progress):
+        case .preparingModel(let kind, let isDownloading, let progress):
             cancelDismiss()
-            transition(to: .working(isDownloading ? .downloadingModel : .loadingModel, progress: progress))
+            transition(to: .working(kind, isDownloading ? .downloadingModel : .loadingModel, progress: progress))
 
-        case .transcribing(_, let progress):
+        case .transcribing(let kind, let progress):
             cancelDismiss()
-            transition(to: .working(.transcribing, progress: progress > 0 ? progress : nil))
+            transition(to: .working(kind, .transcribing, progress: progress > 0 ? progress : nil))
 
+        // Rewriting and inserting only ever follow a dictation: a meeting's text goes
+        // to the transcript, not to whatever happens to have the cursor.
         case .rewriting:
             cancelDismiss()
-            transition(to: .working(.rewriting, progress: nil))
+            transition(to: .working(.dictation, .rewriting, progress: nil))
 
         case .inserting:
             cancelDismiss()
-            transition(to: .working(.inserting, progress: nil))
+            transition(to: .working(.dictation, .inserting, progress: nil))
 
         case .failed(let message):
             flash(.failed(message), for: Linger.failure)

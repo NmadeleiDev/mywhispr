@@ -15,13 +15,17 @@ struct LocalAIClientTests {
     }
 
     @Test func openAICompatibleCompletes() async throws {
-        let session = makeSession(status: 200, body: #"{"choices":[{"message":{"role":"assistant","content":"Clean text."}}]}"#)
+        let session = makeSession(
+            status: 200,
+            body: "data: " + #"{"choices":[{"delta":{"content":"Clean text."}}]}"# + "\n\ndata: [DONE]\n\n"
+        )
         let client = OpenAICompatibleLocalClient(
             baseURL: URL(string: "http://localhost:1234")!,
             model: "local",
             session: session
         )
-        #expect(try await client.complete(systemPrompt: "Clean", text: "raw", timeout: 1) == "Clean text.")
+        let request = LocalAIRequest(messages: [.system("Clean"), .user("raw")], idleTimeout: 1)
+        #expect(try await client.complete(request) == "Clean text.")
     }
 
     private func makeSession(status: Int, body: String) -> URLSession {

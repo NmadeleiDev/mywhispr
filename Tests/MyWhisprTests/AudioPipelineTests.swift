@@ -172,6 +172,46 @@ struct AudioFileWriterTests {
         #expect(try AVAudioFile(forReading: url).length == 128)
     }
 
+    /// The format the file ends up in is the audio's, not the caller's guess.
+    ///
+    /// The caller's guess is a format read from an input bus before capture began,
+    /// and an input bus is free to have renegotiated with the hardware since. When
+    /// the two disagreed, every write was rejected and the take came back empty —
+    /// so the writer takes its format from the buffers it is actually given.
+    @Test func adoptsTheFormatOfTheAudioItIsGiven() throws {
+        let url = temporaryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let expected = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+        // Deliberately not the format the buffers arrive in.
+        let stale = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: false)!
+        let writer = try AudioFileWriter(url: url, settings: stale.settings, label: "test.writer")
+
+        let buffer = AVAudioPCMBuffer(pcmFormat: expected, frameCapacity: 512)!
+        buffer.frameLength = 512
+        writer.writeCopy(of: buffer)
+        writer.finish()
+
+        let written = try AVAudioFile(forReading: url)
+        #expect(written.processingFormat.sampleRate == 16_000)
+        #expect(written.processingFormat.channelCount == 1)
+        #expect(written.length == 512)
+    }
+
+    /// A take that captured nothing still leaves a file behind.
+    ///
+    /// Everything downstream is handed a path and told a recording is at it. "There
+    /// is no speech in this" is an outcome each of them already handles; "there is
+    /// no file" is one none of them does.
+    @Test func aTakeWithNoAudioStillLeavesAReadableFile() throws {
+        let url = temporaryURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false)!
+        let writer = try AudioFileWriter(url: url, settings: format.settings, label: "test.writer")
+        writer.finish()
+
+        #expect(try AVAudioFile(forReading: url).length == 0)
+    }
+
     /// Mirrors the real caller: many producers, as a realtime tap would.
     @Test func acceptsBuffersFromManyThreadsAtOnce() async throws {
         let url = temporaryURL()
@@ -193,5 +233,112 @@ struct AudioFileWriterTests {
         writer.finish()
 
         #expect(try AVAudioFile(forReading: url).length == 6 * 25 * 64)
+    }
+}
+
+/// The microphone recorder's lifecycle, which is where a stuck dictation came from.
+///
+/// The failure was not in recording: it was in *not* recording. `engine.start()`
+/// threw — the input device had just been released by a meeting and Core Audio was
+/// still tearing it down — and the recorder returned from that throw with its tap
+/// still on bus 0. The next dictation's `installTap` then raised an Objective-C
+/// exception, which is not a Swift error, so it unwound through the caller instead
+/// of being handled by it and left the app showing "Listening" with nothing
+/// listening. Every test here is about a take ending completely, whichever way it
+/// ends, so that the next one starts from nothing.
+///
+/// The throwing start itself cannot be provoked from a test — it needs the audio
+/// device to actually go away mid-call — so what is pinned here is the bookkeeping
+/// that made the aftermath unrecoverable.
+@MainActor
+@Suite("Microphone recorder lifecycle")
+struct MicrophoneRecorderLifecycleTests {
+    private func scratchURL() -> URL {
+        FileManager.default.temporaryDirectory
+            .appending(path: "mywhispr-tests-\(UUID().uuidString)")
+            .appending(path: "take.caf")
+    }
+
+    @Test func stoppingWithoutStartingReportsNothing() {
+        let recorder = MicrophoneRecorder()
+        #expect(recorder.stop() == nil)
+    }
+
+    @Test func cancellingWithoutStartingIsHarmless() {
+        let recorder = MicrophoneRecorder()
+        recorder.cancel()
+        recorder.cancel()
+        #expect(recorder.stop() == nil)
+    }
+
+    @Test func aTakeIsHandedOverExactlyOnce() throws {
+        let recorder = MicrophoneRecorder()
+        let url = scratchURL()
+        try recorder.start(outputURL: url)
+
+        let captured = recorder.stop()
+        #expect(captured?.url == url)
+        // The caller owns the file from here — it transcribes it, then deletes it.
+        // A second stop that handed the same URL back would point a second consumer
+        // at a file the first one is entitled to have already removed.
+        #expect(recorder.stop() == nil)
+        recorder.cancel()
+
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    @Test func cancellingDiscardsTheRecording() throws {
+        let recorder = MicrophoneRecorder()
+        let url = scratchURL()
+        try recorder.start(outputURL: url)
+        recorder.cancel()
+
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    @Test func startingWhileRecordingIsRefusedWithoutDisturbingTheTakeInProgress() throws {
+        let recorder = MicrophoneRecorder()
+        let url = scratchURL()
+        try recorder.start(outputURL: url)
+
+        let second = scratchURL()
+        #expect(throws: AudioCaptureError.self) { try recorder.start(outputURL: second) }
+
+        // The refused start must not have ended the live one.
+        #expect(recorder.stop()?.url == url)
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: second.deletingLastPathComponent())
+    }
+
+    /// The regression proper: one recorder, used over and over, the way a day of
+    /// dictating uses it. Anything left installed by take *n* is what take *n + 1*
+    /// raises on.
+    @Test func survivesRepeatedTakesEndedEveryWhichWay() throws {
+        let recorder = MicrophoneRecorder()
+        var written: [URL] = []
+        for index in 0..<8 {
+            let url = scratchURL()
+            try recorder.start(outputURL: url)
+            if index.isMultiple(of: 2) {
+                #expect(recorder.stop()?.url == url)
+                written.append(url)
+            } else {
+                recorder.cancel()
+                #expect(!FileManager.default.fileExists(atPath: url.path))
+            }
+        }
+        #expect(written.count == 4)
+        for url in written { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+    }
+}
+
+@MainActor
+@Suite("Meeting recorder lifecycle")
+struct MeetingRecorderLifecycleTests {
+    /// A meeting that was never started has nothing to hand back — and, more to the
+    /// point, saying so must not depend on either track having succeeded.
+    @Test func stoppingWithoutStartingReportsNothing() {
+        #expect(MeetingRecorder().stop() == nil)
     }
 }

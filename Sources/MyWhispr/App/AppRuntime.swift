@@ -89,11 +89,14 @@ final class AppRuntime {
     let meter = AudioLevelMeter()
     let hud = HUDPresenter()
     let quickPaste = QuickPastePresenter()
+    let chat = MeetingChatController()
     let models: ModelLibrary
 
     private let transcription = TranscriptionService()
     private let diarization = DiarizationService()
-    private let localAI = LocalAIService()
+    /// Shared with ``MeetingChatController``: one place that knows how to reach the
+    /// owner's model server, whatever is being asked of it.
+    let localAI = LocalAIService()
     private let microphone = MicrophoneRecorder()
     private let meetingRecorder = MeetingRecorder()
     private let hotkey = HotkeyMonitor()
@@ -106,6 +109,8 @@ final class AppRuntime {
     private var meetingStartedAt: Date?
     private var currentlyProcessingMeetingID: UUID?
     private var dictationSafetyTask: Task<Void, Never>?
+    /// Deadline on the gap between "the key went down" and "audio is recording".
+    private var dictationStartWatchdog: Task<Void, Never>?
     private var summaryTask: Task<Void, Never>?
     /// The in-flight transcribe/rewrite/insert chain, so it can be abandoned.
     private var processingTask: Task<Void, Never>?
@@ -127,6 +132,7 @@ final class AppRuntime {
 
         hud.attach(runtime: self)
         quickPaste.attach(runtime: self)
+        chat.attach(runtime: self)
         // The event tap can only be created once Input Monitoring is allowed, so it
         // is built the moment that happens rather than at the next launch.
         permissions.onGranted = { [weak self] in self?.configureHotkeys() }
@@ -204,6 +210,7 @@ final class AppRuntime {
     func prepareForTermination() {
         if isMeetingActive { stopMeeting() }
         if case .recording(.dictation, _) = phase { cancelDictation() }
+        if case .preparing(.dictation) = phase { cancelDictation() }
     }
 
     // MARK: - Derived state used by the interface
@@ -262,7 +269,12 @@ final class AppRuntime {
         }
     }
 
+    /// Rewriting dictation needs the rewrite model specifically.
     var canUseLocalAI: Bool { !settings.payload.localAI.model.isEmpty }
+
+    /// Meeting work — summaries and questions — runs on the meeting model, which
+    /// falls back to the rewrite model when only one has been chosen.
+    var canAskLocalAI: Bool { !settings.payload.localAI.effectiveSummaryModel.isEmpty }
 
     var summaryModelName: String {
         let name = settings.payload.localAI.effectiveSummaryModel
@@ -358,9 +370,20 @@ final class AppRuntime {
             return
         }
         phase = .preparing(.dictation)
+        // `.preparing` is the one phase nothing else can leave on the app's behalf:
+        // the key is already down, so no release is coming to close it, and the pill
+        // it shows says "Listening" — which is a lie the moment starting fails. It
+        // has failed here in practice, and not always by throwing: AVFAudio reports
+        // an already-tapped input bus as an Objective-C exception, which unwinds past
+        // every `catch` below and abandons this method between the two lines that
+        // would have set the phase to something else. Hence a deadline rather than
+        // trust in the paths out of here.
+        armDictationStartWatchdog()
         dictationTarget = FocusedTargetCapture.capture()
         do {
             try microphone.start()
+            dictationStartWatchdog?.cancel()
+            dictationStartWatchdog = nil
             startLevelTicker(microphone.levels)
             phase = .recording(.dictation, startedAt: Date())
             playCue(named: "Tink")
@@ -377,6 +400,11 @@ final class AppRuntime {
     }
 
     func finishDictation() {
+        // The key can come back up before capture is running — the owner tapped it,
+        // or starting is taking a moment. There is no take to finish, but the phase
+        // still has to be closed out, because the gesture that would have closed it
+        // has already happened.
+        if case .preparing(.dictation) = phase { return abandonDictationStart() }
         guard case .recording(.dictation, _) = phase else { return }
         dictationSafetyTask?.cancel()
         dictationSafetyTask = nil
@@ -402,6 +430,7 @@ final class AppRuntime {
     }
 
     func cancelDictation() {
+        if case .preparing(.dictation) = phase { return abandonDictationStart() }
         guard case .recording(.dictation, _) = phase else { return }
         dictationSafetyTask?.cancel()
         dictationSafetyTask = nil
@@ -410,6 +439,40 @@ final class AppRuntime {
         dictationTarget = nil
         phase = .idle
     }
+
+    /// Gives up on a dictation that never got as far as recording.
+    ///
+    /// Safe to call when there is nothing to give up on: the recorder tolerates a
+    /// `cancel` it never started, and that tolerance is the point — this runs from a
+    /// watchdog that cannot know how far the start actually got.
+    private func abandonDictationStart() {
+        dictationStartWatchdog?.cancel()
+        dictationStartWatchdog = nil
+        dictationSafetyTask?.cancel()
+        dictationSafetyTask = nil
+        stopLevelTicker()
+        microphone.cancel()
+        dictationTarget = nil
+        phase = .idle
+    }
+
+    private func armDictationStartWatchdog() {
+        dictationStartWatchdog?.cancel()
+        dictationStartWatchdog = nil
+        dictationStartWatchdog = Task { [weak self] in
+            try? await Task.sleep(for: Self.dictationStartDeadline)
+            guard !Task.isCancelled, let self, case .preparing(.dictation) = self.phase else { return }
+            self.logger.error("Dictation never reached recording; clearing the indicator.")
+            self.abandonDictationStart()
+            self.bannerMessage = "The microphone did not start. Try dictating again."
+            self.hud.flashFailure("The microphone did not start")
+        }
+    }
+
+    /// How long starting capture may take before the attempt is written off. Long
+    /// enough for a Bluetooth input to wake up, short enough that a stuck pill is a
+    /// blink rather than something to be quit out of.
+    private static let dictationStartDeadline: Duration = .seconds(4)
 
     /// Strips the noises of speaking from a dictation, if the owner wants that.
     ///
@@ -576,15 +639,29 @@ final class AppRuntime {
     }
 
     func stopMeeting() {
-        guard var record = activeMeeting, let files = meetingRecorder.stop() else { return }
+        guard var record = activeMeeting else { return }
+        let files = meetingRecorder.stop()
+        // The meeting leaves the recording state whatever the recorder returns.
+        // Bailing out before this point on a failed teardown used to leave the app
+        // believing a meeting was still running, with the shortcut that would stop it
+        // now unable to — recoverable only by quitting.
         activeMeeting = nil
         meetingStartedAt = nil
         stopElapsedTicker()
         stopLevelTicker()
-        record.state = .processing
         record.endedAt = Date()
-        record.duration = files.duration
         record.updatedAt = Date()
+        guard let files else {
+            record.state = .failed
+            record.errorMessage = "The recording stopped unexpectedly and could not be saved."
+            try? database.updateSession(record)
+            phase = .idle
+            reloadSessions()
+            hud.flashFailure(record.errorMessage ?? "The recording could not be saved")
+            return
+        }
+        record.state = .processing
+        record.duration = files.duration
         do {
             try database.updateSession(record)
         } catch {
@@ -737,6 +814,7 @@ final class AppRuntime {
                 try? database.updateSession(record)
             }
             reloadSessions()
+            if selectedSessionID == id { loadSelectedDetail() }
             bannerMessage = "Stopped. The recording is kept — open the meeting to try again."
         }
 
@@ -753,10 +831,24 @@ final class AppRuntime {
     // MARK: - Recovery
 
     func retrySession(id: UUID) {
-        guard phase == .idle,
-              let detail = try? database.sessionDetail(id: id),
-              detail.session.state == .failed || detail.session.state == .interrupted,
-              let relativePath = detail.session.audioRelativePath else { return }
+        // Every way this can decline says so. A button that reports nothing back is
+        // indistinguishable from a button that is broken, and the owner pressing it
+        // is already someone whose last attempt did not work.
+        guard phase == .idle else {
+            bannerMessage = isProcessing
+                ? "Something else is being transcribed. This can be retried once it finishes."
+                : "Finish the recording in progress first."
+            return
+        }
+        guard let detail = try? database.sessionDetail(id: id) else {
+            bannerMessage = "This item could not be read."
+            return
+        }
+        guard detail.session.state == .failed || detail.session.state == .interrupted else { return }
+        guard let relativePath = detail.session.audioRelativePath else {
+            bannerMessage = "The recording for this item is no longer available."
+            return
+        }
         let audioURL = database.rootURL.appending(path: relativePath)
 
         switch detail.session.kind {
@@ -766,6 +858,7 @@ final class AppRuntime {
                 return
             }
             phase = .transcribing(.dictation, progress: 0)
+            markProcessing(id)
             processingTask = Task { [weak self] in await self?.retryDictation(detail.session, audioURL: audioURL) }
 
         case .meeting:
@@ -783,6 +876,11 @@ final class AppRuntime {
             try? database.updateSession(record)
             phase = .transcribing(.meeting, progress: 0)
             reloadSessions()
+            // The screen the button lives on reads its state from here, so it has to
+            // be re-read now rather than at whatever later moment happens to reload
+            // it. Without this the recovery notice keeps offering "Try again" for a
+            // retry that is already running, and pressing it again does nothing.
+            if selectedSessionID == id { loadSelectedDetail() }
             let cancellableFiles = MeetingAudioFiles(
                 directoryURL: audioURL,
                 microphoneURL: microphoneURL,
@@ -793,6 +891,17 @@ final class AppRuntime {
                 await self?.processMeeting(record: record, files: cancellableFiles)
             }
         }
+    }
+
+    /// Publishes "this one is being worked on now" to the screen showing it.
+    private func markProcessing(_ id: UUID) {
+        guard var record = try? database.sessionDetail(id: id)?.session else { return }
+        record.state = .processing
+        record.errorMessage = nil
+        record.updatedAt = Date()
+        try? database.updateSession(record)
+        reloadSessions()
+        if selectedSessionID == id { loadSelectedDetail() }
     }
 
     private func retryDictation(_ original: SessionRecord, audioURL: URL) async {
@@ -1179,6 +1288,8 @@ final class AppRuntime {
 
     private func fail(_ error: any Error) {
         logger.error("\(error.localizedDescription)")
+        dictationStartWatchdog?.cancel()
+        dictationStartWatchdog = nil
         bannerMessage = error.localizedDescription
         phase = .idle
         hud.flashFailure(error.localizedDescription)
@@ -1199,11 +1310,13 @@ final class AppRuntime {
     private func loadSelectedDetail() {
         guard let selectedSessionID else {
             selectedDetail = nil
+            chat.reset()
             playback.stop()
             return
         }
         do {
             selectedDetail = try database.sessionDetail(id: selectedSessionID)
+            chat.load(selectedDetail)
             // Playback is offered for a failed or interrupted meeting too. "Did it
             // even record me?" is the first question when processing goes wrong, and
             // the audio is right there.

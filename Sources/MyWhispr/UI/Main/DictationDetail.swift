@@ -59,22 +59,18 @@ struct DictationDetail: View {
                     .controlSize(.small)
             }
 
-            Button {
-                runtime.insertAgain(draft)
-            } label: {
-                Label("Insert", systemImage: "text.insert")
-            }
-            .buttonStyle(.glass)
-            .controlSize(.small)
-            .help("Put this text back into the app you were using")
+            ConfirmingButton(
+                title: "Insert",
+                systemImage: "text.insert",
+                confirmation: "Inserted"
+            ) { runtime.insertAgain(draft) }
+                .help("Put this text back into the app you were using")
 
-            Button {
-                runtime.copy(draft, note: "Copied.")
-            } label: {
-                Label("Copy", systemImage: "doc.on.doc")
-            }
-            .buttonStyle(.glass)
-            .controlSize(.small)
+            ConfirmingButton(
+                title: "Copy",
+                systemImage: "doc.on.doc",
+                confirmation: "Copied"
+            ) { runtime.copy(draft, note: "Copied.") }
 
             if detail.session.state == .failed || detail.session.state == .interrupted {
                 Button {

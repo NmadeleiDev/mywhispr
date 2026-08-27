@@ -84,7 +84,89 @@ final class AppDatabase: @unchecked Sendable {
                 table.column("summary")
             }
         }
+        // Transcripts recorded before the Whisper engine was told to skip the
+        // model's control tokens have them sitting in the text — a
+        // `<|startoftranscript|>` opening every segment and a `<|9.36|>` closing it.
+        // Fixing the engine only fixes the next transcript; an hour-long meeting
+        // already stored would otherwise have to be edited by hand, segment by
+        // segment, which is not a repair anyone should be asked to perform.
+        migrator.registerMigration("v2-strip-model-markup") { db in
+            try removeModelMarkup(in: db)
+        }
+        // Questions asked about a meeting, and the answers given.
+        //
+        // Not indexed for search. Searching meetings is a search for what was *said*,
+        // and folding one's own questions into that would return a meeting because of
+        // a word the owner typed rather than a word anyone spoke.
+        migrator.registerMigration("v3-meeting-chat") { db in
+            try db.create(table: "chatMessages") { table in
+                table.column("id", .text).primaryKey()
+                table.column("sessionID", .text)
+                    .notNull()
+                    .indexed()
+                    .references("sessions", onDelete: .cascade)
+                table.column("position", .integer).notNull()
+                table.column("role", .text).notNull()
+                table.column("content", .text).notNull()
+                table.column("createdAt", .datetime).notNull()
+                table.uniqueKey(["sessionID", "position"])
+            }
+        }
         return migrator
+    }
+
+    /// Rewrites stored text that carries a speech model's own control tokens.
+    ///
+    /// Both texts of a segment are rewritten. `originalText` is what the engine
+    /// heard and is shown when the owner asks what was really said — markup was
+    /// never part of that either — and `editedText` is what everything else reads.
+    /// The search index is rebuilt for whatever changed, since it was indexed on
+    /// the markup too.
+    @discardableResult
+    static func removeModelMarkup(in db: Database) throws -> Int {
+        var touchedSessions: Set<UUID> = []
+
+        let rows = try Row.fetchAll(
+            db,
+            sql: "SELECT id, sessionID, originalText, editedText FROM transcriptSegments"
+        )
+        for row in rows {
+            let original: String = row["originalText"]
+            let edited: String = row["editedText"]
+            guard WhisperMarkup.containsMarkup(original) || WhisperMarkup.containsMarkup(edited) else { continue }
+            let sessionID: UUID = row["sessionID"]
+            try db.execute(
+                sql: "UPDATE transcriptSegments SET originalText = ?, editedText = ? WHERE id = ?",
+                arguments: [WhisperMarkup.stripped(original), WhisperMarkup.stripped(edited), row["id"] as UUID]
+            )
+            touchedSessions.insert(sessionID)
+        }
+
+        // A dictation's title is made from its own text, and a summary is made from
+        // the transcript, so both can carry the same markup.
+        let sessions = try Row.fetchAll(db, sql: "SELECT id, title, summary FROM sessions")
+        for row in sessions {
+            let id: UUID = row["id"]
+            let title: String = row["title"]
+            let summary: String? = row["summary"]
+            let dirtyTitle = WhisperMarkup.containsMarkup(title)
+            let dirtySummary = summary.map(WhisperMarkup.containsMarkup) ?? false
+            guard dirtyTitle || dirtySummary else { continue }
+            try db.execute(
+                sql: "UPDATE sessions SET title = ?, summary = ? WHERE id = ?",
+                arguments: [
+                    dirtyTitle ? WhisperMarkup.stripped(title) : title,
+                    dirtySummary ? summary.map(WhisperMarkup.stripped) : summary,
+                    id,
+                ]
+            )
+            touchedSessions.insert(id)
+        }
+
+        for sessionID in touchedSessions {
+            try Self.rebuildSearchIndex(for: sessionID, db: db)
+        }
+        return touchedSessions.count
     }
 
     func insertSession(_ session: SessionRecord) throws {
@@ -95,7 +177,7 @@ final class AppDatabase: @unchecked Sendable {
         try queue.write { db in
             try session.update(db)
             if session.state == .completed {
-                try rebuildSearchIndex(for: session.id, db: db)
+                try Self.rebuildSearchIndex(for: session.id, db: db)
             }
         }
     }
@@ -104,7 +186,7 @@ final class AppDatabase: @unchecked Sendable {
         try queue.write { db in
             try TranscriptSegmentRecord.filter(Column("sessionID") == session.id).deleteAll(db)
             for segment in segments { try segment.insert(db) }
-            try rebuildSearchIndex(for: session.id, db: db)
+            try Self.rebuildSearchIndex(for: session.id, db: db)
         }
     }
 
@@ -119,8 +201,30 @@ final class AppDatabase: @unchecked Sendable {
                 sql: "SELECT sessionID FROM transcriptSegments WHERE id = ?",
                 arguments: [id]
             ) {
-                try rebuildSearchIndex(for: sessionID, db: db)
+                try Self.rebuildSearchIndex(for: sessionID, db: db)
             }
+        }
+    }
+
+    // MARK: - Meeting conversations
+
+    func chatMessages(for sessionID: UUID) throws -> [ChatMessageRecord] {
+        try queue.read { db in
+            try ChatMessageRecord
+                .filter(Column("sessionID") == sessionID)
+                .order(Column("position"))
+                .fetchAll(db)
+        }
+    }
+
+    func appendChatMessage(_ message: ChatMessageRecord) throws {
+        try queue.write { db in try message.insert(db) }
+    }
+
+    /// Removes the whole conversation about one meeting, leaving the meeting alone.
+    func deleteChatMessages(for sessionID: UUID) throws {
+        try queue.write { db in
+            _ = try ChatMessageRecord.filter(Column("sessionID") == sessionID).deleteAll(db)
         }
     }
 
@@ -185,11 +289,20 @@ final class AppDatabase: @unchecked Sendable {
         }
     }
 
+    /// Recovers everything the last run left mid-flight.
+    ///
+    /// Both live states are the same claim — "a process is working on this right
+    /// now" — and that claim is false the moment the app starts, because the process
+    /// that made it is gone. `recording` was already handled; `processing` was not,
+    /// and a meeting stranded in it showed a progress notice that would never move,
+    /// with no way to restart the work: the audio was on disk and unreachable.
+    /// Both become `interrupted`, which is the state the meeting screen offers to
+    /// retry from.
     func markInterruptedRecordings() throws {
         try queue.write { db in
             try db.execute(
-                sql: "UPDATE sessions SET state = ?, updatedAt = ? WHERE state = ?",
-                arguments: [SessionState.interrupted, Date(), SessionState.recording]
+                sql: "UPDATE sessions SET state = ?, updatedAt = ? WHERE state IN (?, ?)",
+                arguments: [SessionState.interrupted, Date(), SessionState.recording, SessionState.processing]
             )
         }
     }
@@ -228,7 +341,7 @@ final class AppDatabase: @unchecked Sendable {
                 sql: "UPDATE transcriptSegments SET speaker = ? WHERE sessionID = ? AND speaker = ?",
                 arguments: [trimmed, sessionID, original]
             )
-            try rebuildSearchIndex(for: sessionID, db: db)
+            try Self.rebuildSearchIndex(for: sessionID, db: db)
         }
     }
 
@@ -283,7 +396,9 @@ final class AppDatabase: @unchecked Sendable {
         try updateSession(session)
     }
 
-    private func rebuildSearchIndex(for sessionID: UUID, db: Database) throws {
+    /// Static because the migrator needs it too, and it reads nothing but the
+    /// database handle it is given.
+    private static func rebuildSearchIndex(for sessionID: UUID, db: Database) throws {
         guard let session = try SessionRecord.fetchOne(db, key: sessionID) else { return }
         let segments = try TranscriptSegmentRecord
             .filter(Column("sessionID") == sessionID)

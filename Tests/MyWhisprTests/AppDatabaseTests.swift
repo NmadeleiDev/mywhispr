@@ -57,6 +57,39 @@ struct AppDatabaseTests {
         #expect(try database.sessionDetail(id: session.id)?.session.state == .interrupted)
     }
 
+    /// A meeting the last run was still transcribing is recoverable too.
+    ///
+    /// It used to be left claiming to be processing, which no process was: the
+    /// screen showed a progress notice that could never move and offered no way to
+    /// restart, so an hour of audio sat on disk unreachable. Both live states are
+    /// the same claim about a process that no longer exists.
+    @Test func marksInFlightProcessingInterruptedAfterRestart() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/test-data-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try AppDatabase(rootURL: root)
+        let now = Date()
+        func session(_ state: SessionState) -> SessionRecord {
+            SessionRecord(
+                id: UUID(), kind: .meeting, title: "Meeting", state: state,
+                startedAt: now, endedAt: now, duration: 60,
+                sourceApplication: nil, sourceBundleIdentifier: nil,
+                modelSnapshot: "{}", audioRelativePath: "Audio/test", summary: nil,
+                errorMessage: nil, createdAt: now, updatedAt: now
+            )
+        }
+        let transcribing = session(.processing)
+        let finished = session(.completed)
+        try database.insertSession(transcribing)
+        try database.insertSession(finished)
+
+        try database.markInterruptedRecordings()
+
+        #expect(try database.sessionDetail(id: transcribing.id)?.session.state == .interrupted)
+        // Only what was mid-flight. A finished meeting is not reopened.
+        #expect(try database.sessionDetail(id: finished.id)?.session.state == .completed)
+    }
+
     @Test func expiresFailedDictationAndItsRetainedAudio() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appending(path: ".build/test-data-\(UUID().uuidString)", directoryHint: .isDirectory)
