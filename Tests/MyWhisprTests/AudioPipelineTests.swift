@@ -236,20 +236,17 @@ struct AudioFileWriterTests {
     }
 }
 
-/// The microphone recorder's lifecycle, which is where a stuck dictation came from.
+/// The microphone recorder's lifecycle, which is where post-meeting dictation
+/// failures came from.
 ///
-/// The failure was not in recording: it was in *not* recording. `engine.start()`
-/// threw — the input device had just been released by a meeting and Core Audio was
-/// still tearing it down — and the recorder returned from that throw with its tap
-/// still on bus 0. The next dictation's `installTap` then raised an Objective-C
-/// exception, which is not a Swift error, so it unwound through the caller instead
-/// of being handled by it and left the app showing "Listening" with nothing
-/// listening. Every test here is about a take ending completely, whichever way it
-/// ends, so that the next one starts from nothing.
+/// The system-audio aggregate device changed the hardware input from 48 kHz to
+/// 24 kHz when a meeting ended, but a long-lived `AVAudioEngine` kept its 48 kHz
+/// output scope. Every later dictation inherited the stale tap format and failed
+/// with `kAudioUnitErr_FormatNotSupported`. A graph now belongs to one take, so
+/// every test here pins complete ownership and disposal before the next take.
 ///
-/// The throwing start itself cannot be provoked from a test — it needs the audio
-/// device to actually go away mid-call — so what is pinned here is the bookkeeping
-/// that made the aftermath unrecoverable.
+/// The hardware transition itself cannot be manufactured reliably in a package
+/// test, so the repeated-take test also observes engine construction directly.
 @MainActor
 @Suite("Microphone recorder lifecycle")
 struct MicrophoneRecorderLifecycleTests {
@@ -311,11 +308,41 @@ struct MicrophoneRecorderLifecycleTests {
         try? FileManager.default.removeItem(at: second.deletingLastPathComponent())
     }
 
+    @Test func failedStartIsFullyDiscardedBeforeTheNextTake() throws {
+        struct ForcedStartFailure: Error {}
+
+        var attempts = 0
+        let recorder = MicrophoneRecorder(startEngine: { engine in
+            attempts += 1
+            if attempts == 1 { throw ForcedStartFailure() }
+            try engine.start()
+        })
+        let failedURL = scratchURL()
+        #expect(throws: ForcedStartFailure.self) {
+            try recorder.start(outputURL: failedURL)
+        }
+        #expect(!FileManager.default.fileExists(atPath: failedURL.path))
+        #expect(recorder.stop() == nil)
+
+        let successfulURL = scratchURL()
+        try recorder.start(outputURL: successfulURL)
+        #expect(recorder.stop()?.url == successfulURL)
+        #expect(attempts == 2)
+
+        try? FileManager.default.removeItem(at: failedURL.deletingLastPathComponent())
+        try? FileManager.default.removeItem(at: successfulURL.deletingLastPathComponent())
+    }
+
     /// The regression proper: one recorder, used over and over, the way a day of
     /// dictating uses it. Anything left installed by take *n* is what take *n + 1*
     /// raises on.
     @Test func survivesRepeatedTakesEndedEveryWhichWay() throws {
-        let recorder = MicrophoneRecorder()
+        var engines: [AVAudioEngine] = []
+        let recorder = MicrophoneRecorder {
+            let engine = AVAudioEngine()
+            engines.append(engine)
+            return engine
+        }
         var written: [URL] = []
         for index in 0..<8 {
             let url = scratchURL()
@@ -329,6 +356,8 @@ struct MicrophoneRecorderLifecycleTests {
             }
         }
         #expect(written.count == 4)
+        #expect(engines.count == 8)
+        #expect(Set(engines.map(ObjectIdentifier.init)).count == 8)
         for url in written { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
     }
 }
