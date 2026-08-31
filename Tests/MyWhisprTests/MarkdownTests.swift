@@ -95,6 +95,25 @@ struct MarkdownBlockTests {
         #expect(MarkdownBlock.parse("--") == [.paragraph("--")])
     }
 
+    @Test func preservesMarkdownTableRowsAndAlignment() {
+        let table = """
+        | Action Item | Owner |
+        | :--- | :---: |
+        | Provide examples of influencers and real use cases | Grisha |
+        | Request a sample data export | Partner |
+        """
+        #expect(MarkdownBlock.parse(table) == [
+            .table(
+                headers: ["Action Item", "Owner"],
+                alignments: [.leading, .center],
+                rows: [
+                    ["Provide examples of influencers and real use cases", "Grisha"],
+                    ["Request a sample data export", "Partner"],
+                ]
+            ),
+        ])
+    }
+
     @Test func anEmptySummaryProducesNothingToRender() {
         #expect(MarkdownBlock.parse("").isEmpty)
         #expect(MarkdownBlock.parse("\n\n   \n").isEmpty)
@@ -126,8 +145,23 @@ struct MarkdownBlockTests {
     }
 
     /// Emphasis inside a block is still Foundation's job, not this parser's.
-    @Test func inlineEmphasisSurvivesIntoTheRenderedRun() {
+    @Test @MainActor
+    func inlineEmphasisSurvivesIntoTheRenderedRun() {
         let attributed = MarkdownText.inline("**Core Value Gap:** the landing page is vague")
         #expect(String(attributed.characters) == "Core Value Gap: the landing page is vague")
+    }
+
+    @Test @MainActor
+    func rendersModelMathAndCurrencyAsNativeText() {
+        let source = "Standard flow: Introduction $\\rightarrow$ Brief. Budget: ideally $\\ge $20,000$/month; minimum $$15,000$."
+        let attributed = MarkdownText.inline(source)
+
+        #expect(String(attributed.characters)
+            == "Standard flow: Introduction → Brief. Budget: ideally ≥ $20,000/month; minimum $15,000.")
+    }
+
+    @Test func leavesOrdinaryCurrencyAndPathsUntouched() {
+        let source = #"Budget is $20,000/month; assets live in C:\tools."#
+        #expect(MarkdownInlineText.normalized(source) == source)
     }
 }

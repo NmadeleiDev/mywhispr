@@ -21,6 +21,23 @@ struct SettingsStoreTests {
         #expect(restored.payload.dictationProfile != restored.payload.meetingProfile)
     }
 
+    @Test("Summary language survives relaunch and old settings keep the safe default")
+    func persistsSummaryLanguageCompatibly() throws {
+        let suite = "MyWhisprTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.payload.localAI.summaryLanguage == .transcript)
+        store.payload.localAI.summaryLanguage = .de
+        #expect(SettingsStore(defaults: defaults).payload.localAI.summaryLanguage == .de)
+
+        defaults.set(Data(#"{"localAI":{"model":"existing-model"}}"#.utf8), forKey: "settings.payload.v2")
+        let legacy = SettingsStore(defaults: defaults)
+        #expect(legacy.payload.localAI.model == "existing-model")
+        #expect(legacy.payload.localAI.summaryLanguage == .transcript)
+    }
+
     @Test("The two former per-workflow word lists become one shared vocabulary")
     func migratesSplitVocabularies() throws {
         let suite = "MyWhisprTests.\(UUID().uuidString)"

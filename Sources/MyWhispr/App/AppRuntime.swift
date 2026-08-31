@@ -3,6 +3,30 @@ import Foundation
 import Observation
 import OSLog
 
+/// One summary may use the local model at a time, and it belongs to exactly one
+/// recording. Keeping the owner ID in the state prevents every meeting view from
+/// interpreting global model activity as its own progress.
+struct SummaryGenerationState: Equatable, Sendable {
+    private(set) var sessionID: UUID?
+
+    var isActive: Bool { sessionID != nil }
+
+    func isGenerating(for sessionID: UUID) -> Bool {
+        self.sessionID == sessionID
+    }
+
+    mutating func start(for sessionID: UUID) -> Bool {
+        guard self.sessionID == nil else { return false }
+        self.sessionID = sessionID
+        return true
+    }
+
+    mutating func finish(for sessionID: UUID) {
+        guard self.sessionID == sessionID else { return }
+        self.sessionID = nil
+    }
+}
+
 /// The application's single coordinator.
 ///
 /// Every surface — HUD, menu bar, main window, palette — reads from here and calls
@@ -26,7 +50,7 @@ final class AppRuntime {
     private(set) var selectedDetail: SessionDetail?
     private(set) var localModels: [String] = []
     private(set) var localAIStatus: LocalAIStatus = .idle
-    private(set) var isGeneratingSummary = false
+    private(set) var summaryGeneration = SummaryGenerationState()
     private(set) var shortcutConflicts: Set<GlobalHotkeyCenter.Action> = []
 
     /// Whether the dictation key is actually being watched right now.
@@ -1103,30 +1127,38 @@ final class AppRuntime {
     }
 
     func generateSummary(for sessionID: UUID) {
-        guard !isGeneratingSummary,
+        guard summaryGeneration.start(for: sessionID),
               let detail = try? database.sessionDetail(id: sessionID),
-              !detail.transcript.isEmpty else { return }
-        isGeneratingSummary = true
+              !detail.transcript.isEmpty else {
+            summaryGeneration.finish(for: sessionID)
+            return
+        }
         let configuration = settings.payload.localAI
         summaryTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let summary = try await localAI.summarize(detail.transcript, configuration: configuration)
+                let summary = try await localAI.summarize(detail.annotatedTranscript, configuration: configuration)
                 guard !Task.isCancelled else { return }
-                self.updateSummary(summary, for: sessionID)
-                self.isGeneratingSummary = false
+                self.updateGeneratedSummary(summary, for: sessionID)
+                self.finishSummaryGeneration(for: sessionID)
             } catch {
                 guard !Task.isCancelled else { return }
-                self.isGeneratingSummary = false
+                self.finishSummaryGeneration(for: sessionID)
                 self.bannerMessage = "Summary failed: \(error.localizedDescription)"
             }
         }
     }
 
-    func cancelSummary() {
+    func cancelSummary(for sessionID: UUID) {
+        guard summaryGeneration.isGenerating(for: sessionID) else { return }
         summaryTask?.cancel()
         summaryTask = nil
-        isGeneratingSummary = false
+        summaryGeneration.finish(for: sessionID)
+    }
+
+    private func finishSummaryGeneration(for sessionID: UUID) {
+        summaryTask = nil
+        summaryGeneration.finish(for: sessionID)
     }
 
     func updateSummary(_ summary: String, for sessionID: UUID) {
@@ -1134,6 +1166,22 @@ final class AppRuntime {
         session.summary = summary
         session.updatedAt = Date()
         do {
+            try database.updateSession(session)
+            loadSelectedDetail()
+            reloadSessions()
+        } catch {
+            fail(error)
+        }
+    }
+
+    private func updateGeneratedSummary(_ generated: MeetingSummary, for sessionID: UUID) {
+        guard var session = try? database.sessionDetail(id: sessionID)?.session else { return }
+        session.title = generated.title
+        session.summary = generated.markdown
+        session.updatedAt = Date()
+        do {
+            // One database update makes the generated title and notes atomic: the
+            // sidebar can never show a new title paired with stale notes.
             try database.updateSession(session)
             loadSelectedDetail()
             reloadSessions()

@@ -1,4 +1,11 @@
+import Foundation
 import SwiftUI
+
+enum MarkdownColumnAlignment: Equatable {
+    case leading
+    case center
+    case trailing
+}
 
 /// One block of a Markdown document, flattened.
 ///
@@ -12,6 +19,7 @@ enum MarkdownBlock: Equatable {
     case numbered(depth: Int, number: String, text: String)
     case quote(String)
     case code(language: String?, text: String)
+    case table(headers: [String], alignments: [MarkdownColumnAlignment], rows: [[String]])
     case rule
 
     /// Splits a Markdown document into blocks.
@@ -24,6 +32,7 @@ enum MarkdownBlock: Equatable {
         var blocks: [MarkdownBlock] = []
         var paragraph: [String] = []
         var fence: (language: String?, lines: [String])?
+        var acceptingTableRows = false
 
         func flushParagraph() {
             let joined = paragraph.joined(separator: " ").trimmingCharacters(in: .whitespaces)
@@ -67,6 +76,7 @@ enum MarkdownBlock: Equatable {
             }
 
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                acceptingTableRows = false
                 flushParagraph()
                 let language = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
                 fence = (language.isEmpty ? nil : language, [])
@@ -74,7 +84,36 @@ enum MarkdownBlock: Equatable {
             }
 
             if trimmed.isEmpty {
+                acceptingTableRows = false
                 flushParagraph()
+                continue
+            }
+
+            if acceptingTableRows,
+               let cells = tableCells(from: trimmed),
+               case .table(let headers, let alignments, var rows) = blocks.last,
+               cells.count == headers.count {
+                rows.append(cells)
+                blocks[blocks.count - 1] = .table(
+                    headers: headers,
+                    alignments: alignments,
+                    rows: rows
+                )
+                continue
+            }
+            acceptingTableRows = false
+
+            // A table is recognised by its separator row. The header itself was
+            // accumulated as a possible paragraph on the previous line; pull just
+            // that line back out while preserving any paragraph before it.
+            if let alignments = tableAlignments(from: trimmed),
+               let headerLine = paragraph.last,
+               let headers = tableCells(from: headerLine),
+               headers.count == alignments.count {
+                paragraph.removeLast()
+                flushParagraph()
+                blocks.append(.table(headers: headers, alignments: alignments, rows: []))
+                acceptingTableRows = true
                 continue
             }
 
@@ -167,6 +206,33 @@ enum MarkdownBlock: Equatable {
         return false
     }
 
+    private static func tableCells(from line: String) -> [String]? {
+        var body = line.trimmingCharacters(in: .whitespaces)
+        guard body.contains("|") else { return nil }
+        if body.hasPrefix("|") { body.removeFirst() }
+        if body.hasSuffix("|") { body.removeLast() }
+        let cells = body.split(separator: "|", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        return cells.count >= 2 ? cells : nil
+    }
+
+    private static func tableAlignments(from line: String) -> [MarkdownColumnAlignment]? {
+        guard let cells = tableCells(from: line) else { return nil }
+        var alignments: [MarkdownColumnAlignment] = []
+        for cell in cells {
+            let marker = cell.trimmingCharacters(in: .whitespaces)
+            let core = marker.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            guard core.count >= 3, core.allSatisfy({ $0 == "-" }) else { return nil }
+            switch (marker.hasPrefix(":"), marker.hasSuffix(":")) {
+            case (true, true): alignments.append(.center)
+            case (false, true): alignments.append(.trailing)
+            default: alignments.append(.leading)
+            }
+        }
+        return alignments
+    }
+
     private static func indentDepth(of line: String) -> Int {
         let spaces = line.prefix { $0 == " " }.count
         return min(spaces / 2, 3)
@@ -235,8 +301,84 @@ struct MarkdownText: View {
                 .padding(8)
                 .background(.background.secondary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
 
+        case .table(let headers, let alignments, let rows):
+            markdownTable(headers: headers, alignments: alignments, rows: rows)
+
         case .rule:
             Divider().padding(.vertical, 2)
+        }
+    }
+
+    private func markdownTable(
+        headers: [String],
+        alignments: [MarkdownColumnAlignment],
+        rows: [[String]]
+    ) -> some View {
+        let widths = headers.indices.map { column in
+            tableColumnWidth(column, headers: headers, rows: rows)
+        }
+        return ScrollView(.horizontal) {
+            VStack(alignment: .leading, spacing: 0) {
+                tableRow(headers, alignments: alignments, widths: widths, isHeader: true)
+                Divider()
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    tableRow(row, alignments: alignments, widths: widths, isHeader: false)
+                        .background(index.isMultiple(of: 2) ? .clear : Color.primary.opacity(0.025))
+                    if index < rows.count - 1 { Divider().opacity(0.5) }
+                }
+            }
+            .background(.background.secondary.opacity(0.45))
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(.quaternary, lineWidth: 1)
+            }
+        }
+    }
+
+    private func tableRow(
+        _ cells: [String],
+        alignments: [MarkdownColumnAlignment],
+        widths: [CGFloat],
+        isHeader: Bool
+    ) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(cells.indices, id: \.self) { column in
+                Text(Self.inline(cells[column]))
+                    .font(.system(size: baseSize, weight: isHeader ? .semibold : .regular))
+                    .frame(
+                        width: widths[column],
+                        alignment: tableAlignment(alignments[column])
+                    )
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 7)
+                    .overlay(alignment: .trailing) {
+                        if column < cells.count - 1 {
+                            Rectangle().fill(.quaternary).frame(width: 1)
+                        }
+                    }
+            }
+        }
+    }
+
+    private func tableColumnWidth(
+        _ column: Int,
+        headers: [String],
+        rows: [[String]]
+    ) -> CGFloat {
+        let contents = [headers[column]] + rows.compactMap { row in
+            row.indices.contains(column) ? row[column] : nil
+        }
+        let longest = contents.map(\.count).max() ?? 0
+        let ideal = CGFloat(longest) * 6.4
+        return min(max(ideal, column == 0 ? 180 : 90), column == 0 ? 420 : 240)
+    }
+
+    private func tableAlignment(_ alignment: MarkdownColumnAlignment) -> Alignment {
+        switch alignment {
+        case .leading: .topLeading
+        case .center: .top
+        case .trailing: .topTrailing
         }
     }
 
@@ -276,9 +418,84 @@ struct MarkdownText: View {
     /// parser `Text` uses for its own Markdown support. Malformed inline syntax
     /// falls back to the literal text rather than losing the line.
     static func inline(_ text: String) -> AttributedString {
-        (try? AttributedString(
-            markdown: text,
+        let normalized = MarkdownInlineText.normalized(text)
+        return (try? AttributedString(
+            markdown: normalized,
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )) ?? AttributedString(text)
+        )) ?? AttributedString(normalized)
+    }
+}
+
+/// Models occasionally write TeX despite being asked for Markdown. Foundation's
+/// Markdown parser does not render TeX, so a small vocabulary of notation common
+/// in meeting notes is converted to native Unicode before inline Markdown parsing.
+/// This deliberately does not run for fenced code blocks.
+enum MarkdownInlineText {
+    private static let operatorPatterns: [(String, String)] = [
+        (#"\$\s*\\(?:rightarrow|to)\s*\$"#, "→"),
+        (#"\$\s*\\leftarrow\s*\$"#, "←"),
+        (#"\$\s*\\leftrightarrow\s*\$"#, "↔"),
+        (#"\$\s*\\(?:ge|geq)\s*\$"#, "≥"),
+        (#"\$\s*\\(?:le|leq)\s*\$"#, "≤"),
+        (#"\$\s*\\neq\s*\$"#, "≠"),
+        (#"\$\s*\\approx\s*\$"#, "≈"),
+        (#"\$\s*\\times\s*\$"#, "×"),
+        (#"\$\s*\\pm\s*\$"#, "±"),
+    ]
+
+    private static let bareCommands: [(String, String)] = [
+        (#"\\(?:rightarrow|to)(?![A-Za-z])"#, "→"),
+        (#"\\leftarrow(?![A-Za-z])"#, "←"),
+        (#"\\leftrightarrow(?![A-Za-z])"#, "↔"),
+        (#"\\(?:ge|geq)(?![A-Za-z])"#, "≥"),
+        (#"\\(?:le|leq)(?![A-Za-z])"#, "≤"),
+        (#"\\neq(?![A-Za-z])"#, "≠"),
+        (#"\\approx(?![A-Za-z])"#, "≈"),
+        (#"\\times(?![A-Za-z])"#, "×"),
+        (#"\\pm(?![A-Za-z])"#, "±"),
+    ]
+
+    static func normalized(_ text: String) -> String {
+        var result = text
+
+        // A frequent malformed mix of TeX comparison and Markdown currency:
+        // `$\ge $20,000$/month` means `≥ $20,000/month`.
+        result = replacing(#"\$\s*\\(?:ge|geq)\s+\${1,2}(?=[0-9])"#, in: result, with: "≥ $")
+        result = replacing(#"\$\s*\\(?:le|leq)\s+\${1,2}(?=[0-9])"#, in: result, with: "≤ $")
+
+        for (pattern, symbol) in operatorPatterns {
+            result = replacing(pattern, in: result, with: symbol)
+        }
+        for (pattern, symbol) in bareCommands {
+            result = replacing(pattern, in: result, with: symbol)
+        }
+
+        return unwrappingCurrency(in: result)
+            .replacingOccurrences(of: #"\$"#, with: "$")
+    }
+
+    private static func replacing(_ pattern: String, in text: String, with replacement: String) -> String {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return expression.stringByReplacingMatches(in: text, range: range, withTemplate: replacement)
+    }
+
+    /// Turns `$20,000$` and `$$15,000$` into ordinary currency while leaving a
+    /// normal `$20,000` amount and unrelated dollar signs untouched.
+    private static func unwrappingCurrency(in text: String) -> String {
+        guard let expression = try? NSRegularExpression(
+            pattern: #"\${1,2}([0-9][0-9,.]*)\$(?=/|\s|[.,;:)]|$)"#
+        ) else { return text }
+        var result = text
+        let matches = expression.matches(
+            in: result,
+            range: NSRange(result.startIndex..<result.endIndex, in: result)
+        )
+        for match in matches.reversed() {
+            guard let whole = Range(match.range(at: 0), in: result),
+                  let amount = Range(match.range(at: 1), in: result) else { continue }
+            result.replaceSubrange(whole, with: "$" + result[amount])
+        }
+        return result
     }
 }

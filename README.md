@@ -129,8 +129,9 @@ question view.
 - Connect to Ollama or a loopback OpenAI-compatible endpoint such as LM Studio.
 - Discover the models served by the configured endpoint and choose separate
   models for fast dictation rewriting and deeper meeting work.
-- Generate meeting summaries on demand with an editable prompt; render the
-  Markdown result and let it be edited, copied, stopped, or regenerated.
+- Generate meeting summaries on demand in the transcript's language or a chosen
+  language. The same request creates a scannable recording title for the sidebar;
+  render the Markdown notes and let them be edited, copied, stopped, or regenerated.
 - Ask follow-up questions against an entire meeting transcript, including speaker
   names and timestamps. Answers stream into a persistent per-meeting conversation
   and can be stopped without discarding the text already received.

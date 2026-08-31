@@ -34,6 +34,9 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
     var rewriteEnabled = false
     var rewritePrompt = LocalAIConfiguration.defaultRewritePrompt
     var summaryPrompt = "Create concise meeting notes with decisions and action items. Do not invent facts. Return Markdown."
+    /// Language used for both the generated meeting title and its notes. Matching
+    /// the transcript is the least surprising default for multilingual owners.
+    var summaryLanguage = SummaryLanguage.transcript
     /// What the model is told before a question about a meeting.
     var chatPrompt = LocalAIConfiguration.defaultChatPrompt
     /// Rewriting runs inside the gap between releasing the key and seeing text
@@ -69,6 +72,7 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
         rewriteEnabled = value(.rewriteEnabled, fallback.rewriteEnabled)
         rewritePrompt = value(.rewritePrompt, fallback.rewritePrompt)
         summaryPrompt = value(.summaryPrompt, fallback.summaryPrompt)
+        summaryLanguage = value(.summaryLanguage, fallback.summaryLanguage)
         chatPrompt = value(.chatPrompt, fallback.chatPrompt)
         rewriteTimeoutSeconds = value(.rewriteTimeoutSeconds, fallback.rewriteTimeoutSeconds)
         allowLAN = value(.allowLAN, fallback.allowLAN)
@@ -130,6 +134,47 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
     /// default in one place instead of at every call site.
     var effectiveSummaryModel: String {
         summaryModel.isEmpty ? model : summaryModel
+    }
+}
+
+/// The language of model-written meeting metadata, separate from the language the
+/// speech recognizer listens for. A transcript may be detected automatically while
+/// its owner still wants every set of notes written in one consistent language.
+enum SummaryLanguage: String, Codable, CaseIterable, Identifiable, Sendable {
+    case transcript
+    case en, ru, de, fr, es, it, pt, nl, pl, uk, tr, ja, ko, zh, ar, hi
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .transcript: "Match transcript"
+        case .en: "English"
+        case .ru: "Russian"
+        case .de: "German"
+        case .fr: "French"
+        case .es: "Spanish"
+        case .it: "Italian"
+        case .pt: "Portuguese"
+        case .nl: "Dutch"
+        case .pl: "Polish"
+        case .uk: "Ukrainian"
+        case .tr: "Turkish"
+        case .ja: "Japanese"
+        case .ko: "Korean"
+        case .zh: "Chinese"
+        case .ar: "Arabic"
+        case .hi: "Hindi"
+        }
+    }
+
+    var promptInstruction: String {
+        switch self {
+        case .transcript:
+            "Write both the title and the summary in the predominant language of the transcript."
+        default:
+            "Write both the title and the summary in \(displayName)."
+        }
     }
 }
 

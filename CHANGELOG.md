@@ -8,7 +8,25 @@ the public API and release process stabilize.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-31
+
 ### Added
+
+- Configurable output language for generated meeting notes, including an option
+  to follow the transcript language.
+- LLM-generated recording titles saved with summaries and displayed throughout
+  meeting history.
+- Native rendering for Markdown tables and common model-generated mathematical
+  notation in meeting summaries.
+
+### Fixed
+
+- Scoped summary-generation progress and cancellation to the recording that owns
+  the request instead of showing activity on every meeting.
+- Preserved table rows, alignment, currency, and common symbols when rendering
+  model-generated Markdown.
+
+### Project
 
 - Open-source project documentation, community standards, issue forms, pull
   request guidance, and macOS continuous integration.

@@ -63,6 +63,9 @@ struct MeetingDetail: View {
         .onChange(of: canAsk) { _, possible in
             if !possible { mode = .transcript }
         }
+        .onChange(of: detail.session.title) { _, title in
+            titleDraft = title
+        }
         .alert("Rename speaker", isPresented: Binding(
             get: { renamingSpeaker != nil },
             set: { if !$0 { renamingSpeaker = nil } }
@@ -111,7 +114,8 @@ struct MeetingDetail: View {
                         PlaybackBar(playback: runtime.playback)
                     }
 
-                    if detail.session.summary != nil || runtime.isGeneratingSummary {
+                    if detail.session.summary != nil
+                        || runtime.summaryGeneration.isGenerating(for: detail.session.id) {
                         summarySection
                     }
 
@@ -176,15 +180,29 @@ struct MeetingDetail: View {
     private var actionBar: some View {
         HStack(spacing: 8) {
             if detail.session.state == .completed {
-                if runtime.isGeneratingSummary {
+                if runtime.summaryGeneration.isGenerating(for: detail.session.id) {
                     Button {
-                        runtime.cancelSummary()
+                        runtime.cancelSummary(for: detail.session.id)
                     } label: {
                         Label("Stop", systemImage: "stop.circle")
                     }
                     .buttonStyle(.glass)
                     .controlSize(.small)
                 } else {
+                    Picker("Summary language", selection: Binding(
+                        get: { runtime.settings.payload.localAI.summaryLanguage },
+                        set: { runtime.settings.payload.localAI.summaryLanguage = $0 }
+                    )) {
+                        ForEach(SummaryLanguage.allCases) { language in
+                            Text(language.displayName).tag(language)
+                        }
+                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .fixedSize()
+                    .help("Language for the generated title and summary")
+                    .disabled(runtime.summaryGeneration.isActive)
+
                     Button {
                         runtime.generateSummary(for: detail.session.id)
                     } label: {
@@ -195,11 +213,13 @@ struct MeetingDetail: View {
                     }
                     .buttonStyle(.glass)
                     .controlSize(.small)
-                    .disabled(!runtime.canAskLocalAI)
+                    .disabled(!runtime.canAskLocalAI || runtime.summaryGeneration.isActive)
                     .help(
-                        runtime.canAskLocalAI
-                            ? "Write meeting notes with your local AI model"
-                            : "Connect a local AI service in Settings to summarize"
+                        !runtime.canAskLocalAI
+                            ? "Connect a local AI service in Settings to summarize"
+                            : runtime.summaryGeneration.isActive
+                                ? "Wait for the other summary to finish"
+                                : "Write meeting notes with your local AI model"
                     )
                 }
 
@@ -315,7 +335,7 @@ struct MeetingDetail: View {
 
     private var summarySection: some View {
         Card(title: "Summary") {
-            if runtime.isGeneratingSummary {
+            if runtime.summaryGeneration.isGenerating(for: detail.session.id) {
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
                     Text("Writing notes with \(runtime.summaryModelName)…")

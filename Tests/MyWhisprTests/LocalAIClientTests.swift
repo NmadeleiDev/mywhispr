@@ -4,6 +4,45 @@ import Testing
 
 @Suite("Local AI response handling", .serialized)
 struct LocalAIClientTests {
+    @Test("Summary response carries a title and Markdown notes")
+    func parsesGeneratedMeetingMetadata() throws {
+        let response = """
+        <title>Mobile app launch plan</title>
+        <summary>
+        ## Decisions
+        - Ship the beta on Friday.
+        </summary>
+        """
+
+        #expect(try MeetingSummary.parse(response) == MeetingSummary(
+            title: "Mobile app launch plan",
+            markdown: "## Decisions\n- Ship the beta on Friday."
+        ))
+    }
+
+    @Test("Incomplete summary responses are rejected without partial data")
+    func rejectsMalformedMeetingMetadata() {
+        #expect(throws: LocalAIError.invalidSummaryResponse) {
+            try MeetingSummary.parse("## Summary\n- A title is missing")
+        }
+        #expect(throws: LocalAIError.invalidSummaryResponse) {
+            try MeetingSummary.parse("<title>Title</title><summary></summary>")
+        }
+    }
+
+    @Test("Chosen summary language applies to both generated fields")
+    func summaryPromptIncludesLanguage() throws {
+        var configuration = LocalAIConfiguration()
+        configuration.summaryLanguage = .ru
+        let messages = LocalAIService.summaryMessages("Transcript", configuration: configuration)
+
+        let instruction = try #require(messages.first?.content)
+        #expect(instruction.contains("Write both the title and the summary in Russian."))
+        #expect(instruction.contains("Do not use LaTeX or dollar-delimited math."))
+        #expect(instruction.contains("<title>"))
+        #expect(instruction.contains("<summary>"))
+    }
+
     @Test func ollamaDiscoversModels() async throws {
         let session = makeSession(status: 200, body: #"{"models":[{"name":"qwen3:4b"},{"name":"gemma3:4b"}]}"#)
         let client = OllamaClient(

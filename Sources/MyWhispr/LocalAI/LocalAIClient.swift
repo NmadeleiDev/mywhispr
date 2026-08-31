@@ -99,25 +99,47 @@ actor LocalAIService {
     func summarize(
         _ transcript: String,
         configuration: LocalAIConfiguration
-    ) async throws -> String {
+    ) async throws -> MeetingSummary {
         let model = configuration.effectiveSummaryModel
         guard !model.isEmpty else { throw LocalAIError.modelNotSelected }
         try Self.validate(configuration: configuration)
-        let messages: [LocalAIMessage] = [
-            .system(configuration.summaryPrompt),
-            .user("<transcript>\n\(transcript)\n</transcript>"),
-        ]
+        let messages = Self.summaryMessages(transcript, configuration: configuration)
         let request = LocalAIRequest(
             messages: messages,
             idleTimeout: 180,
             temperature: 0.2,
             contextTokens: TokenBudget.context(for: messages, limit: configuration.maxContextTokens)
         )
-        let answer = try await client(configuration: configuration, model: model)
-            .complete(request)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !answer.isEmpty else { throw LocalAIError.emptyAnswer }
-        return answer
+        let answer = try await client(configuration: configuration, model: model).complete(request)
+        return try MeetingSummary.parse(answer)
+    }
+
+    static func summaryMessages(
+        _ transcript: String,
+        configuration: LocalAIConfiguration
+    ) -> [LocalAIMessage] {
+        [
+            .system("""
+            \(configuration.summaryPrompt)
+
+            Also create a specific, scannable title for this recording based only on \
+            the transcript. The title must be plain text, at most 80 characters, and \
+            must not include a date, quotation marks, Markdown, or a generic label \
+            such as "Meeting". \(configuration.summaryLanguage.promptInstruction)
+
+            Use standard Markdown only. Do not use LaTeX or dollar-delimited math. \
+            Write symbols as Unicode (for example, → and ≥), and write currency \
+            normally (for example, $20,000). If you use a table, emit a valid \
+            Markdown pipe table with one row per line and a separator row.
+
+            Return exactly this envelope, with no text outside it:
+            <title>Short recording title</title>
+            <summary>
+            Markdown meeting notes
+            </summary>
+            """),
+            .user("<transcript>\n\(transcript)\n</transcript>"),
+        ]
     }
 
     /// Answers one question about a meeting, streaming the answer as it is written.
@@ -220,6 +242,34 @@ actor LocalAIService {
         if abs(after - before) <= 24 { return true }
         let ratio = Double(after) / Double(before)
         return ratio >= 0.5 && ratio <= 1.5
+    }
+}
+
+struct MeetingSummary: Equatable, Sendable {
+    var title: String
+    var markdown: String
+
+    static func parse(_ response: String) throws -> MeetingSummary {
+        guard let titleRange = response.range(of: "<title>"),
+              let titleEnd = response.range(of: "</title>", range: titleRange.upperBound..<response.endIndex),
+              let summaryRange = response.range(of: "<summary>", range: titleEnd.upperBound..<response.endIndex),
+              let summaryEnd = response.range(of: "</summary>", range: summaryRange.upperBound..<response.endIndex) else {
+            throw LocalAIError.invalidSummaryResponse
+        }
+
+        let outside = response[..<titleRange.lowerBound] + response[summaryEnd.upperBound...]
+        let title = response[titleRange.upperBound..<titleEnd.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let markdown = response[summaryRange.upperBound..<summaryEnd.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard outside.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !title.isEmpty,
+              title.count <= 80,
+              !title.contains("\n"),
+              !markdown.isEmpty else {
+            throw LocalAIError.invalidSummaryResponse
+        }
+        return MeetingSummary(title: title, markdown: markdown)
     }
 }
 
@@ -379,6 +429,7 @@ enum LocalAIError: LocalizedError, Equatable {
     case nonLocalEndpoint
     case modelNotSelected
     case invalidResponse
+    case invalidSummaryResponse
     case rewriteDivergedFromSpeech
     case timedOut
     case emptyAnswer
@@ -390,6 +441,7 @@ enum LocalAIError: LocalizedError, Equatable {
         case .nonLocalEndpoint: "Only loopback model servers are allowed unless LAN access is enabled."
         case .modelNotSelected: "Select a local language model first."
         case .invalidResponse: "The local model server returned an invalid response."
+        case .invalidSummaryResponse: "The local model did not return a usable title and summary. Try again."
         case .rewriteDivergedFromSpeech: "The local model rewrote the dictation instead of tidying it."
         case .timedOut: "The local model did not answer in time."
         case .emptyAnswer: "The local model returned an empty answer."
