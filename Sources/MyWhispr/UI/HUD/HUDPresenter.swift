@@ -166,7 +166,11 @@ final class HUDPresenter {
     }
 
     private func hidePanel() {
-        panel?.orderOut(nil)
+        guard let panel else { return }
+        // A transient HUD owns its panel only while the interaction is visible.
+        self.panel = nil
+        panel.contentView = nil
+        panel.close()
     }
 
     private func existingPanel() -> HUDPanel {

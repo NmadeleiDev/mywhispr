@@ -85,7 +85,12 @@ final class QuickPastePresenter {
             NotificationCenter.default.removeObserver(resignObserver)
             self.resignObserver = nil
         }
-        panel?.orderOut(nil)
+        if let panel {
+            // A summoned palette has no hidden window state worth retaining.
+            self.panel = nil
+            panel.contentView = nil
+            panel.close()
+        }
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
             self.escapeMonitor = nil
