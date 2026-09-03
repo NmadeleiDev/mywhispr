@@ -95,8 +95,6 @@ final class AppRuntime {
         }
     }
 
-    var bannerMessage: String?
-
     enum LocalAIStatus: Equatable {
         case idle
         case checking
@@ -112,6 +110,7 @@ final class AppRuntime {
     let playback = MeetingPlaybackController()
     let meter = AudioLevelMeter()
     let hud = HUDPresenter()
+    let toast = ToastPresenter()
     let quickPaste = QuickPastePresenter()
     let chat = MeetingChatController()
     let models: ModelLibrary
@@ -222,7 +221,10 @@ final class AppRuntime {
         NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { _, error in
             Task { @MainActor in
                 if let error {
-                    self.bannerMessage = "MyWhispr could not restart: \(error.localizedDescription)"
+                    self.toast.present(
+                        "MyWhispr could not restart: \(error.localizedDescription)",
+                        tone: .failure
+                    )
                 } else {
                     NSApp.terminate(nil)
                 }
@@ -371,7 +373,7 @@ final class AppRuntime {
         do {
             try settings.setLaunchAtLogin(enabled)
         } catch {
-            bannerMessage = "Login item could not be changed: \(error.localizedDescription)"
+            toast.present("Login item could not be changed: \(error.localizedDescription)", tone: .failure)
         }
     }
 
@@ -385,12 +387,12 @@ final class AppRuntime {
     func startDictation() {
         guard phase == .idle else {
             if activeMeeting != nil {
-                bannerMessage = "A meeting is recording, so the microphone is busy."
+                toast.present("A meeting is recording, so the microphone is busy.", tone: .warning)
             }
             return
         }
         guard permissions.dictationReady else {
-            bannerMessage = "Finish setup before dictating."
+            toast.present("Finish setup before dictating.", tone: .warning)
             return
         }
         phase = .preparing(.dictation)
@@ -415,7 +417,7 @@ final class AppRuntime {
             dictationSafetyTask = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(ceiling))
                 guard !Task.isCancelled else { return }
-                self?.bannerMessage = "Dictation reached its time limit and was inserted."
+                self?.toast.present("Dictation reached its time limit and was inserted.", tone: .information)
                 self?.finishDictation()
             }
         } catch {
@@ -488,7 +490,7 @@ final class AppRuntime {
             guard !Task.isCancelled, let self, case .preparing(.dictation) = self.phase else { return }
             self.logger.error("Dictation never reached recording; clearing the indicator.")
             self.abandonDictationStart()
-            self.bannerMessage = "The microphone did not start. Try dictating again."
+            self.toast.present("The microphone did not start. Try dictating again.", tone: .failure)
             self.hud.flashFailure("The microphone did not start")
         }
     }
@@ -555,7 +557,7 @@ final class AppRuntime {
                 } catch {
                     // A failed rewrite must never cost the owner their words.
                     logger.notice("Local rewrite skipped: \(error.localizedDescription)")
-                    bannerMessage = "Rewrite was skipped — inserted what you actually said."
+                    toast.present("Rewrite was skipped — inserted what you actually said.", tone: .warning)
                 }
             }
             try Task.checkCancellation()
@@ -618,7 +620,7 @@ final class AppRuntime {
     func startMeeting() {
         guard canStartMeeting else {
             if permissions.microphone != .granted {
-                bannerMessage = "Allow microphone access before recording a meeting."
+                toast.present("Allow microphone access before recording a meeting.", tone: .warning)
             }
             return
         }
@@ -798,7 +800,7 @@ final class AppRuntime {
             }
 
             phase = .idle
-            bannerMessage = "“\(record.title)” is ready."
+            toast.present("“\(record.title)” is ready.", tone: .success)
             reloadSessions()
             refreshStorageSizes()
             if selectedSessionID == record.id { loadSelectedDetail() }
@@ -813,7 +815,10 @@ final class AppRuntime {
             processingTask = nil
             phase = .idle
             hud.flashFailure(error.localizedDescription)
-            bannerMessage = "Processing failed. The recording is safe — open the meeting to try again."
+            toast.present(
+                "Processing failed. The recording is safe — open the meeting to try again.",
+                tone: .failure
+            )
             reloadSessions()
         }
     }
@@ -839,7 +844,10 @@ final class AppRuntime {
             }
             reloadSessions()
             if selectedSessionID == id { loadSelectedDetail() }
-            bannerMessage = "Stopped. The recording is kept — open the meeting to try again."
+            toast.present(
+                "Stopped. The recording is kept — open the meeting to try again.",
+                tone: .information
+            )
         }
 
         currentlyProcessingMeetingID = nil
@@ -859,18 +867,21 @@ final class AppRuntime {
         // indistinguishable from a button that is broken, and the owner pressing it
         // is already someone whose last attempt did not work.
         guard phase == .idle else {
-            bannerMessage = isProcessing
-                ? "Something else is being transcribed. This can be retried once it finishes."
-                : "Finish the recording in progress first."
+            toast.present(
+                isProcessing
+                    ? "Something else is being transcribed. This can be retried once it finishes."
+                    : "Finish the recording in progress first.",
+                tone: .warning
+            )
             return
         }
         guard let detail = try? database.sessionDetail(id: id) else {
-            bannerMessage = "This item could not be read."
+            toast.present("This item could not be read.", tone: .failure)
             return
         }
         guard detail.session.state == .failed || detail.session.state == .interrupted else { return }
         guard let relativePath = detail.session.audioRelativePath else {
-            bannerMessage = "The recording for this item is no longer available."
+            toast.present("The recording for this item is no longer available.", tone: .failure)
             return
         }
         let audioURL = database.rootURL.appending(path: relativePath)
@@ -878,7 +889,7 @@ final class AppRuntime {
         switch detail.session.kind {
         case .dictation:
             guard FileManager.default.fileExists(atPath: audioURL.path) else {
-                bannerMessage = "The recording for this dictation is no longer available."
+                toast.present("The recording for this dictation is no longer available.", tone: .failure)
                 return
             }
             phase = .transcribing(.dictation, progress: 0)
@@ -890,7 +901,7 @@ final class AppRuntime {
             let systemURL = audioURL.appending(path: "system.caf")
             guard FileManager.default.fileExists(atPath: microphoneURL.path),
                   FileManager.default.fileExists(atPath: systemURL.path) else {
-                bannerMessage = "This meeting's recordings are incomplete."
+                toast.present("This meeting's recordings are incomplete.", tone: .failure)
                 return
             }
             var record = detail.session
@@ -979,7 +990,7 @@ final class AppRuntime {
     func copy(_ text: String, note: String?) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-        if let note { bannerMessage = note }
+        if let note { toast.present(note, tone: .success) }
     }
 
     /// Puts previously dictated text back into whatever the owner was using.
@@ -1092,7 +1103,7 @@ final class AppRuntime {
             try database.deleteEverything()
             reloadSessions()
             refreshStorageSizes()
-            bannerMessage = "Everything was deleted."
+            toast.present("Everything was deleted.", tone: .success)
         } catch {
             fail(error)
         }
@@ -1144,7 +1155,7 @@ final class AppRuntime {
             } catch {
                 guard !Task.isCancelled else { return }
                 self.finishSummaryGeneration(for: sessionID)
-                self.bannerMessage = "Summary failed: \(error.localizedDescription)"
+                self.toast.present("Summary failed: \(error.localizedDescription)", tone: .failure)
             }
         }
     }
@@ -1231,7 +1242,7 @@ final class AppRuntime {
                 self.meter.push(relay.drain())
                 if let error = relay.takeError() {
                     self.logger.error("Recording error: \(error.localizedDescription)")
-                    self.bannerMessage = error.localizedDescription
+                    self.toast.present(error.localizedDescription, tone: .failure)
                 }
             }
         }
@@ -1338,7 +1349,7 @@ final class AppRuntime {
         logger.error("\(error.localizedDescription)")
         dictationStartWatchdog?.cancel()
         dictationStartWatchdog = nil
-        bannerMessage = error.localizedDescription
+        toast.present(error.localizedDescription, tone: .failure)
         phase = .idle
         hud.flashFailure(error.localizedDescription)
     }

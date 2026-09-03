@@ -48,7 +48,7 @@ final class QuickPastePresenter {
         query = ""
         highlighted = 0
         guard !items.isEmpty else {
-            runtime.bannerMessage = "There are no dictations to insert yet."
+            runtime.toast.present("There are no dictations to insert yet.", tone: .information)
             return
         }
         isVisible = true

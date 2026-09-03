@@ -8,6 +8,12 @@ the public API and release process stabilize.
 
 ## [Unreleased]
 
+### Fixed
+
+- Replaced persistent, layout-shifting status banners with accessible floating
+  notifications that dismiss automatically and remain visible longer for warnings
+  and failures.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added

@@ -8,3 +8,4 @@ DerivedData/
 
 # Design pipeline working notes; local only.
 .ux/
+.solve/

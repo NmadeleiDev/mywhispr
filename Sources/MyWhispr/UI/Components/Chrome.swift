@@ -152,33 +152,3 @@ struct StatusPill: View {
         }
     }
 }
-
-/// A transient message strip shown at the top of the main window.
-struct BannerView: View {
-    var message: String
-    var onDismiss: () -> Void
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Text(message)
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer(minLength: 8)
-            Button {
-                onDismiss()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 10, weight: .bold))
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.tertiary)
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .glassEffect(.regular, in: .rect(cornerRadius: Metrics.card, style: .continuous))
-        .padding(.horizontal, 14)
-        .padding(.top, 8)
-        .transition(.move(edge: .top).combined(with: .opacity))
-    }
-}

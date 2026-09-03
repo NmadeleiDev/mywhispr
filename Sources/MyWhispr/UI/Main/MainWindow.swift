@@ -13,6 +13,7 @@ enum WindowID {
 /// learn the database's vocabulary instead of using their own.
 struct MainWindow: View {
     @Environment(AppRuntime.self) private var runtime
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var searchFocused: Bool
     /// A meeting owns irreplaceable audio, so its deletion is confirmed. A dictation
     /// is text that can be spoken again, so it is not — asking every time would
@@ -36,6 +37,17 @@ struct MainWindow: View {
         }
         .frame(minWidth: 820, minHeight: 520)
         .background(.background)
+        .overlay(alignment: .topTrailing) {
+            if let toast = runtime.toast.current {
+                ToastView(toast: toast) { runtime.toast.dismiss() }
+                    .padding(.top, 72)
+                    .padding(.trailing, 16)
+                    .id(toast.id)
+                    .transition(toastTransition)
+                    .zIndex(10)
+            }
+        }
+        .animation(toastAnimation, value: runtime.toast.current)
         .onReceive(NotificationCenter.default.publisher(for: .myWhisprFocusSearch)) { _ in
             searchFocused = true
         }
@@ -55,6 +67,14 @@ struct MainWindow: View {
         } message: {
             Text("The transcript, the summary, and both audio tracks are removed from this Mac. This cannot be undone.")
         }
+    }
+
+    private var toastTransition: AnyTransition {
+        reduceMotion ? .opacity : .move(edge: .trailing).combined(with: .opacity)
+    }
+
+    private var toastAnimation: Animation {
+        reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.24)
     }
 
     /// One deletion route for the list, whichever gesture asked for it.
@@ -151,11 +171,7 @@ private struct DetailHeader: View {
             if !runtime.permissions.dictationReady {
                 PermissionBanner(runtime: runtime)
             }
-            if let message = runtime.bannerMessage {
-                BannerView(message: message) { runtime.bannerMessage = nil }
-            }
         }
-        .animation(.smooth(duration: 0.25), value: runtime.bannerMessage)
     }
 }
 
