@@ -27,6 +27,117 @@ struct SummaryGenerationState: Equatable, Sendable {
     }
 }
 
+enum MeetingSemanticIndexState: Equatable, Sendable {
+    case idle
+    case indexing(completed: Int, total: Int)
+    case ready(Int)
+    case failed(String)
+}
+
+/// The connection whose model catalog is being described.
+///
+/// Availability is meaningful only for the exact service that was queried. LAN
+/// permission is part of that identity because it changes whether the endpoint is
+/// allowed to be queried at all.
+struct LocalModelSource: Equatable, Sendable {
+    var provider: LocalAIConfiguration.Provider
+    var baseURL: String
+    var allowLAN: Bool
+
+    init(configuration: LocalAIConfiguration) {
+        provider = configuration.provider
+        baseURL = configuration.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        allowLAN = configuration.allowLAN
+    }
+}
+
+/// One authoritative model-catalog state: its contents and whether those contents
+/// are trustworthy cannot disagree.
+struct LocalModelCatalog: Equatable, Sendable {
+    enum State: Equatable, Sendable {
+        case notLoaded
+        case loading
+        case available([String])
+        case failed(String)
+    }
+
+    struct Request: Equatable, Sendable {
+        fileprivate var source: LocalModelSource
+        fileprivate var generation: UInt
+    }
+
+    private var source: LocalModelSource?
+    private var state: State = .notLoaded
+    private var generation: UInt = 0
+
+    mutating func begin(source: LocalModelSource) -> Request {
+        generation &+= 1
+        self.source = source
+        state = .loading
+        return Request(source: source, generation: generation)
+    }
+
+    mutating func invalidate(for source: LocalModelSource) {
+        generation &+= 1
+        self.source = source
+        state = .notLoaded
+    }
+
+    @discardableResult
+    mutating func receive(_ models: [String], for request: Request) -> Bool {
+        guard accepts(request) else { return false }
+        state = .available(models)
+        return true
+    }
+
+    @discardableResult
+    mutating func fail(_ message: String, for request: Request) -> Bool {
+        guard accepts(request) else { return false }
+        state = .failed(message)
+        return true
+    }
+
+    func state(for source: LocalModelSource) -> State {
+        self.source == source ? state : .notLoaded
+    }
+
+    func models(for source: LocalModelSource) -> [String] {
+        guard case .available(let models) = state(for: source) else { return [] }
+        return models
+    }
+
+    func confirmsMissing(_ model: String, from source: LocalModelSource) -> Bool {
+        guard case .available(let models) = state(for: source) else { return false }
+        return !models.contains(model)
+    }
+
+    private func accepts(_ request: Request) -> Bool {
+        request.generation == generation
+            && request.source == source
+            && state == .loading
+    }
+}
+
+/// Monotonic identity for the one transcription job the app may own.
+/// Cancellation advances the value, making every callback captured by the old job
+/// provably stale even if its model library takes time to unwind.
+struct ProcessingGeneration: Equatable, Sendable {
+    private(set) var value: UInt = 0
+
+    mutating func begin() -> UInt {
+        value &+= 1
+        return value
+    }
+
+    mutating func invalidate() {
+        value &+= 1
+    }
+
+    func isCurrent(_ generation: UInt) -> Bool {
+        generation == value
+    }
+}
+
 /// The application's single coordinator.
 ///
 /// Every surface — HUD, menu bar, main window, palette — reads from here and calls
@@ -48,8 +159,9 @@ final class AppRuntime {
     private(set) var sessions: [SessionRecord] = []
     private(set) var recentDictations: [SessionRecord] = []
     private(set) var selectedDetail: SessionDetail?
-    private(set) var localModels: [String] = []
-    private(set) var localAIStatus: LocalAIStatus = .idle
+    private(set) var localModelCatalog = LocalModelCatalog()
+    private(set) var localEmbeddingModels: [String] = []
+    private(set) var meetingSemanticIndexState: MeetingSemanticIndexState = .idle
     private(set) var summaryGeneration = SummaryGenerationState()
     private(set) var shortcutConflicts: Set<GlobalHotkeyCenter.Action> = []
 
@@ -63,6 +175,7 @@ final class AppRuntime {
     private(set) var isDictationListening = false
     private(set) var meetingAudioBytes: Int64 = 0
     private(set) var databaseBytes: Int64 = 0
+    private(set) var meetingSourceTarget: MeetingSourceTarget?
 
     /// Incremented once a second while a meeting records. Views that show elapsed
     /// time observe this; without it nothing would republish, because the elapsed
@@ -87,19 +200,12 @@ final class AppRuntime {
         }
     }
 
-    var filter: WorkflowKind = .dictation {
+    var filter: WorkflowKind = .meeting {
         didSet {
             guard filter != oldValue else { return }
             selectedSessionID = nil
             reloadSessions()
         }
-    }
-
-    enum LocalAIStatus: Equatable {
-        case idle
-        case checking
-        case connected(models: Int)
-        case failed(String)
     }
 
     // MARK: - Collaborators
@@ -112,12 +218,13 @@ final class AppRuntime {
     let hud = HUDPresenter()
     let toast = ToastPresenter()
     let quickPaste = QuickPastePresenter()
-    let chat = MeetingChatController()
+    let meetingChat = ConversationController()
+    let workspaceChat = ConversationController()
     let models: ModelLibrary
 
     private let transcription = TranscriptionService()
     private let diarization = DiarizationService()
-    /// Shared with ``MeetingChatController``: one place that knows how to reach the
+    /// Shared with ``ConversationController``: one place that knows how to reach the
     /// owner's model server, whatever is being asked of it.
     let localAI = LocalAIService()
     private let microphone = MicrophoneRecorder()
@@ -130,13 +237,22 @@ final class AppRuntime {
     private var dictationTarget: FocusedTextTarget?
     private var activeMeeting: SessionRecord?
     private var meetingStartedAt: Date?
-    private var currentlyProcessingMeetingID: UUID?
+    /// Present for persisted work (meetings and retried dictations), and assigned
+    /// before its HUD state is published so cancellation always knows what it owns.
+    private var processingSessionID: UUID?
+    private var processingKind: WorkflowKind?
     private var dictationSafetyTask: Task<Void, Never>?
     /// Deadline on the gap between "the key went down" and "audio is recording".
     private var dictationStartWatchdog: Task<Void, Never>?
     private var summaryTask: Task<Void, Never>?
+    @ObservationIgnored private var localModelDiscoveryTask: Task<Void, Never>?
+    @ObservationIgnored private var meetingSemanticIndexTask: Task<Void, Never>?
     /// The in-flight transcribe/rewrite/insert chain, so it can be abandoned.
     private var processingTask: Task<Void, Never>?
+    /// Invalidates progress and completion callbacks from work that has already
+    /// been cancelled. Some model libraries unwind asynchronously, so cancelling
+    /// the Swift task alone does not make their queued callbacks disappear.
+    private var processingGate = ProcessingGeneration()
     private var elapsedTicker: Task<Void, Never>?
     private var levelTicker: Task<Void, Never>?
 
@@ -146,16 +262,22 @@ final class AppRuntime {
     var openWindowHandler: ((String) -> Void)?
     var closeWindowHandler: ((String) -> Void)?
 
-    init() throws {
+    init(databaseRootURL: URL? = nil) throws {
         settings = SettingsStore()
         permissions = PermissionCenter()
-        database = try AppDatabase()
+        if let databaseRootURL {
+            database = try AppDatabase(rootURL: databaseRootURL)
+        } else {
+            database = try AppDatabase()
+        }
         models = ModelLibrary(transcription: transcription)
 
 
         hud.attach(runtime: self)
         quickPaste.attach(runtime: self)
-        chat.attach(runtime: self)
+        meetingChat.attach(runtime: self)
+        workspaceChat.attach(runtime: self)
+        workspaceChat.loadWorkspace()
         // The event tap can only be created once Input Monitoring is allowed, so it
         // is built the moment that happens rather than at the next launch.
         permissions.onGranted = { [weak self] in self?.configureHotkeys() }
@@ -171,6 +293,10 @@ final class AppRuntime {
         settings.refreshLaunchAtLoginStatus()
         configureHotkeys()
         applyActivationPolicy()
+        // Existing installations already have a chat model selected but have no
+        // persisted embedding choice yet. Discover once at launch so an installed
+        // embedding model becomes active without requiring a trip through Settings.
+        if canAskLocalAI { discoverLocalModels() }
     }
 
     /// Re-applies every setting that has an effect outside its own stored value.
@@ -201,9 +327,20 @@ final class AppRuntime {
             refreshStorageSizes()
         }
         if payload.localAI.provider != previous.localAI.provider
-            || payload.localAI.baseURL != previous.localAI.baseURL {
-            localModels = []
-            localAIStatus = .idle
+            || payload.localAI.baseURL != previous.localAI.baseURL
+            || payload.localAI.allowLAN != previous.localAI.allowLAN {
+            localModelDiscoveryTask?.cancel()
+            localModelDiscoveryTask = nil
+            localModelCatalog.invalidate(for: LocalModelSource(configuration: payload.localAI))
+            localEmbeddingModels = []
+        }
+        if payload.localAI.embeddingModel != previous.localAI.embeddingModel
+            || payload.localAI.provider != previous.localAI.provider
+            || payload.localAI.baseURL != previous.localAI.baseURL
+            || payload.localAI.allowLAN != previous.localAI.allowLAN {
+            meetingSemanticIndexTask?.cancel()
+            meetingSemanticIndexTask = nil
+            prepareSemanticMeetingSearch()
         }
     }
 
@@ -305,6 +442,10 @@ final class AppRuntime {
     var summaryModelName: String {
         let name = settings.payload.localAI.effectiveSummaryModel
         return name.isEmpty ? "your local model" : name
+    }
+
+    var localModelSource: LocalModelSource {
+        LocalModelSource(configuration: settings.payload.localAI)
     }
 
     var storageLocation: String {
@@ -450,8 +591,10 @@ final class AppRuntime {
         }
         let target = dictationTarget
         dictationTarget = nil
+        let generation = processingGate.begin()
+        processingKind = .dictation
         processingTask = Task { [weak self] in
-            await self?.processDictation(captured, target: target)
+            await self?.processDictation(captured, target: target, generation: generation)
         }
     }
 
@@ -521,8 +664,10 @@ final class AppRuntime {
         _ stage: TranscriptionStage,
         _ fraction: Double?,
         kind: WorkflowKind,
+        generation: UInt,
         span: ClosedRange<Double> = 0...1
     ) {
+        guard processingGate.isCurrent(generation) else { return }
         switch stage {
         case .downloadingModel:
             phase = .preparingModel(kind, isDownloading: true, progress: fraction)
@@ -534,7 +679,12 @@ final class AppRuntime {
         }
     }
 
-    private func processDictation(_ captured: CapturedAudio, target: FocusedTextTarget?) async {
+    private func processDictation(
+        _ captured: CapturedAudio,
+        target: FocusedTextTarget?,
+        generation: UInt
+    ) async {
+        guard processingGate.isCurrent(generation) else { return }
         phase = .transcribing(.dictation, progress: 0)
         let profile = settings.payload.dictationProfile
         do {
@@ -545,9 +695,11 @@ final class AppRuntime {
                 channel: .microphone
             ) { stage, fraction in
                 Task { @MainActor [weak self] in
-                    self?.report(stage, fraction, kind: .dictation)
+                    self?.report(stage, fraction, kind: .dictation, generation: generation)
                 }
             }
+            try Task.checkCancellation()
+            guard processingGate.isCurrent(generation) else { throw CancellationError() }
             let faithful = TextCleaner.clean(tidied(result.text))
             var output = faithful
             if settings.payload.localAI.rewriteEnabled {
@@ -565,7 +717,7 @@ final class AppRuntime {
             let outcome = await textInserter.insert(output, into: target)
             try persistDictation(output, result: result, target: target, profile: profile, duration: captured.duration)
             try? FileManager.default.removeItem(at: captured.url)
-            processingTask = nil
+            finishProcessing(generation)
             phase = .idle
             lastInsertedText = output
             switch outcome {
@@ -581,10 +733,10 @@ final class AppRuntime {
             // The owner walked away from this take; its audio is temporary and goes
             // with it rather than accumulating as recoverable failures.
             try? FileManager.default.removeItem(at: captured.url)
-            processingTask = nil
+            finishProcessing(generation)
         } catch {
-            guard !Task.isCancelled else { return }
-            processingTask = nil
+            guard !Task.isCancelled, processingGate.isCurrent(generation) else { return }
+            finishProcessing(generation)
             let message = (error as? TranscriptionEngineError) == .noSpeech
                 ? "No speech was heard."
                 : error.localizedDescription
@@ -647,7 +799,7 @@ final class AppRuntime {
         )
         do {
             try database.insertSession(record)
-            try meetingRecorder.start(directoryURL: directoryURL)
+            let captureMode = try meetingRecorder.start(directoryURL: directoryURL)
             startLevelTicker(meetingRecorder.levels)
             activeMeeting = record
             meetingStartedAt = startedAt
@@ -655,6 +807,12 @@ final class AppRuntime {
             playCue(named: "Tink")
             startElapsedTicker()
             reloadSessions()
+            if case .microphoneOnly = captureMode {
+                toast.present(
+                    "Recording the microphone. Mac audio is unavailable for this meeting.",
+                    tone: .information
+                )
+            }
         } catch {
             record.state = .failed
             record.errorMessage = error.localizedDescription
@@ -686,6 +844,26 @@ final class AppRuntime {
             hud.flashFailure(record.errorMessage ?? "The recording could not be saved")
             return
         }
+        if MeetingRecordingPolicy.shouldDiscard(microphoneDuration: files.microphoneDuration) {
+            phase = .idle
+            playCue(named: "Pop")
+            do {
+                // Deleting through the store removes both the provisional row and
+                // its audio directory, so a short take cannot surface in Library,
+                // search, storage totals, or the meeting corpus later.
+                try database.deleteSession(id: record.id)
+                reloadSessions()
+                refreshStorageSizes()
+                toast.present("Meeting under 10 seconds wasn’t saved.", tone: .information)
+            } catch {
+                record.state = .failed
+                record.errorMessage = "The short recording could not be discarded: \(error.localizedDescription)"
+                try? database.updateSession(record)
+                reloadSessions()
+                fail(error)
+            }
+            return
+        }
         record.state = .processing
         record.duration = files.duration
         do {
@@ -693,10 +871,15 @@ final class AppRuntime {
         } catch {
             logger.error("Meeting update failed: \(error.localizedDescription)")
         }
+        let generation = processingGate.begin()
+        processingKind = .meeting
+        processingSessionID = record.id
         phase = .transcribing(.meeting, progress: 0)
         playCue(named: "Pop")
         reloadSessions()
-        processingTask = Task { [weak self] in await self?.processMeeting(record: record, files: files) }
+        processingTask = Task { [weak self] in
+            await self?.processMeeting(record: record, files: files, generation: generation)
+        }
     }
 
     /// Transcribes one of a meeting's two tracks, tolerating an empty one.
@@ -709,44 +892,64 @@ final class AppRuntime {
         at url: URL,
         channel: AudioChannel,
         profile: TranscriptionProfile,
+        generation: UInt,
         span: ClosedRange<Double>
     ) async throws -> TranscriptionResult {
+        try Task.checkCancellation()
+        guard processingGate.isCurrent(generation) else { throw CancellationError() }
         let empty = TranscriptionResult(text: "", detectedLanguage: nil, segments: [])
         let isSilent = await Task.detached(priority: .utility) { AudioProbe.isSilent(url) }.value
+        try Task.checkCancellation()
+        guard processingGate.isCurrent(generation) else { throw CancellationError() }
         guard !isSilent else {
             logger.notice("Meeting \(channel.rawValue) track held no signal; skipping transcription.")
-            report(.running, 1, kind: .meeting, span: span)
+            report(.running, 1, kind: .meeting, generation: generation, span: span)
             return empty
         }
         do {
-            return try await transcription.transcribe(
+            let result = try await transcription.transcribe(
                 audioURL: url,
                 profile: profile,
                 vocabulary: settings.payload.vocabulary,
                 channel: channel,
                 progress: { stage, fraction in
                     Task { @MainActor [weak self] in
-                        self?.report(stage, fraction, kind: .meeting, span: span)
+                        self?.report(stage, fraction, kind: .meeting, generation: generation, span: span)
                     }
                 }
             )
+            try Task.checkCancellation()
+            guard processingGate.isCurrent(generation) else { throw CancellationError() }
+            return result
         } catch TranscriptionEngineError.noSpeech {
             return empty
         }
     }
 
-    private func processMeeting(record original: SessionRecord, files: MeetingAudioFiles) async {
+    private func processMeeting(
+        record original: SessionRecord,
+        files: MeetingAudioFiles,
+        generation: UInt
+    ) async {
+        guard processingGate.isCurrent(generation) else { return }
         var record = original
-        currentlyProcessingMeetingID = record.id
-        defer { currentlyProcessingMeetingID = nil }
         do {
             let profile = settings.payload.meetingProfile
             let microphoneResult = try await transcribeTrack(
-                at: files.microphoneURL, channel: .microphone, profile: profile, span: 0...0.35
+                at: files.microphoneURL, channel: .microphone, profile: profile,
+                generation: generation, span: 0...0.3
             )
-            let systemResult = try await transcribeTrack(
-                at: files.systemURL, channel: .system, profile: profile, span: 0.35...0.7
-            )
+            let systemResult: TranscriptionResult
+            if let systemURL = files.systemURL {
+                systemResult = try await transcribeTrack(
+                    at: systemURL, channel: .system, profile: profile,
+                    generation: generation, span: 0.3...0.6
+                )
+            } else {
+                systemResult = TranscriptionResult(text: "", detectedLanguage: nil, segments: [])
+                report(.running, 1, kind: .meeting, generation: generation, span: 0.3...0.6)
+            }
+            try Task.checkCancellation()
             // One silent track is normal, not a failure: a meeting where nobody else
             // is on this Mac's audio has an empty system track, and a meeting the
             // owner only listened to has an empty microphone track. Only a recording
@@ -755,24 +958,36 @@ final class AppRuntime {
                 throw MeetingProcessingError.noSpeechInEitherTrack
             }
 
-            let speakerIntervals: [SpeakerInterval]
-            if systemResult.segments.isEmpty {
-                // Speaker separation runs on the far end. With no far end there is
-                // nobody to tell apart, and the models are worth neither the download
-                // nor the minutes.
-                speakerIntervals = []
-                report(.running, 1, kind: .meeting, span: 0.7...1)
+            let microphoneSpeakers: [SpeakerInterval]
+            if microphoneResult.segments.isEmpty {
+                microphoneSpeakers = []
+                report(.running, 1, kind: .meeting, generation: generation, span: 0.6...0.8)
             } else {
-                speakerIntervals = try await diarization.diarize(audioURL: files.systemURL) { stage, fraction in
+                microphoneSpeakers = try await diarization.diarize(audioURL: files.microphoneURL) { stage, fraction in
                     Task { @MainActor [weak self] in
-                        self?.report(stage, fraction, kind: .meeting, span: 0.7...1)
+                        self?.report(stage, fraction, kind: .meeting, generation: generation, span: 0.6...0.8)
                     }
                 }
+            }
+            try Task.checkCancellation()
+            let systemSpeakers: [SpeakerInterval]
+            if systemResult.segments.isEmpty || files.systemURL == nil {
+                systemSpeakers = []
+                report(.running, 1, kind: .meeting, generation: generation, span: 0.8...1)
+            } else if let systemURL = files.systemURL {
+                systemSpeakers = try await diarization.diarize(audioURL: systemURL) { stage, fraction in
+                    Task { @MainActor [weak self] in
+                        self?.report(stage, fraction, kind: .meeting, generation: generation, span: 0.8...1)
+                    }
+                }
+            } else {
+                systemSpeakers = []
             }
             let merged = MeetingTranscriptMerger.merge(
                 microphone: microphoneResult.segments,
                 system: systemResult.segments,
-                speakers: speakerIntervals
+                microphoneSpeakers: microphoneSpeakers,
+                systemSpeakers: systemSpeakers
             )
             let records = merged.enumerated().map { index, segment in
                 TranscriptSegmentRecord(
@@ -793,7 +1008,7 @@ final class AppRuntime {
             record.updatedAt = Date()
             try database.updateSession(record)
             try database.replaceSegments(records, for: record)
-            processingTask = nil
+            finishProcessing(generation)
 
             if settings.payload.meetingAudioRetention == .discardAfterTranscription {
                 try? database.discardAudio(for: record.id)
@@ -805,14 +1020,14 @@ final class AppRuntime {
             refreshStorageSizes()
             if selectedSessionID == record.id { loadSelectedDetail() }
         } catch is CancellationError {
-            // `cancelProcessing` owns the state change; nothing to report.
+            // `cancelProcessing` owns deletion and the visible state change.
         } catch {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, processingGate.isCurrent(generation) else { return }
             record.state = .failed
             record.errorMessage = error.localizedDescription
             record.updatedAt = Date()
             try? database.updateSession(record)
-            processingTask = nil
+            finishProcessing(generation)
             phase = .idle
             hud.flashFailure(error.localizedDescription)
             toast.present(
@@ -827,32 +1042,56 @@ final class AppRuntime {
     ///
     /// Waiting is the one part of dictation the owner cannot shorten, so being able
     /// to walk away from it matters. What happens to the work depends on whether it
-    /// can be recovered: a dictation's audio is temporary and goes with it, while a
-    /// meeting's recording is the irreplaceable part and is kept, with the meeting
-    /// left in a state its own screen offers to retry.
+    /// can be recovered: a fresh dictation's audio is temporary and goes with it;
+    /// confirming Discard for a meeting removes both its provisional record and its
+    /// audio, matching the destructive label the owner clicked.
     func cancelProcessing() {
-        guard processingTask != nil else { return }
-        processingTask?.cancel()
+        guard let task = processingTask else { return }
+        let cancelledKind = processingKind
+        let cancelledSessionID = processingSessionID
+        processingGate.invalidate()
+        task.cancel()
         processingTask = nil
+        processingSessionID = nil
+        processingKind = nil
+        phase = .idle
+        hud.dismissImmediately()
 
-        if case .transcribing(.meeting, _) = phase, let id = currentlyProcessingMeetingID {
-            if var record = try? database.sessionDetail(id: id)?.session, record.state == .processing {
-                record.state = .interrupted
+        guard let id = cancelledSessionID else { return }
+        if cancelledKind == .dictation {
+            if var record = try? database.sessionDetail(id: id)?.session {
+                record.state = .failed
                 record.errorMessage = nil
                 record.updatedAt = Date()
                 try? database.updateSession(record)
             }
             reloadSessions()
-            if selectedSessionID == id { loadSelectedDetail() }
-            toast.present(
-                "Stopped. The recording is kept — open the meeting to try again.",
-                tone: .information
-            )
+            return
         }
+        do {
+            if selectedSessionID == id { selectedSessionID = nil }
+            try database.deleteSession(id: id)
+            reloadSessions()
+            refreshStorageSizes()
+            toast.present("Meeting discarded.", tone: .information)
+        } catch {
+            if var record = try? database.sessionDetail(id: id)?.session {
+                record.state = .interrupted
+                record.errorMessage = "The meeting could not be discarded: \(error.localizedDescription)"
+                record.updatedAt = Date()
+                try? database.updateSession(record)
+            }
+            reloadSessions()
+            fail(error)
+        }
+    }
 
-        currentlyProcessingMeetingID = nil
-        phase = .idle
-        hud.dismissImmediately()
+    private func finishProcessing(_ generation: UInt) {
+        guard processingGate.isCurrent(generation) else { return }
+        processingGate.invalidate()
+        processingTask = nil
+        processingSessionID = nil
+        processingKind = nil
     }
 
     /// True while there is something worth cancelling.
@@ -892,23 +1131,31 @@ final class AppRuntime {
                 toast.present("The recording for this dictation is no longer available.", tone: .failure)
                 return
             }
+            let generation = processingGate.begin()
+            processingKind = .dictation
+            processingSessionID = id
             phase = .transcribing(.dictation, progress: 0)
             markProcessing(id)
-            processingTask = Task { [weak self] in await self?.retryDictation(detail.session, audioURL: audioURL) }
+            processingTask = Task { [weak self] in
+                await self?.retryDictation(detail.session, audioURL: audioURL, generation: generation)
+            }
 
         case .meeting:
             let microphoneURL = audioURL.appending(path: "microphone.caf")
             let systemURL = audioURL.appending(path: "system.caf")
-            guard FileManager.default.fileExists(atPath: microphoneURL.path),
-                  FileManager.default.fileExists(atPath: systemURL.path) else {
+            guard FileManager.default.fileExists(atPath: microphoneURL.path) else {
                 toast.present("This meeting's recordings are incomplete.", tone: .failure)
                 return
             }
+            let retainedSystemURL = FileManager.default.fileExists(atPath: systemURL.path) ? systemURL : nil
             var record = detail.session
             record.state = .processing
             record.errorMessage = nil
             record.updatedAt = Date()
             try? database.updateSession(record)
+            let generation = processingGate.begin()
+            processingKind = .meeting
+            processingSessionID = record.id
             phase = .transcribing(.meeting, progress: 0)
             reloadSessions()
             // The screen the button lives on reads its state from here, so it has to
@@ -919,11 +1166,12 @@ final class AppRuntime {
             let cancellableFiles = MeetingAudioFiles(
                 directoryURL: audioURL,
                 microphoneURL: microphoneURL,
-                systemURL: systemURL,
+                systemURL: retainedSystemURL,
+                microphoneDuration: record.duration,
                 duration: record.duration
             )
             processingTask = Task { [weak self] in
-                await self?.processMeeting(record: record, files: cancellableFiles)
+                await self?.processMeeting(record: record, files: cancellableFiles, generation: generation)
             }
         }
     }
@@ -939,7 +1187,12 @@ final class AppRuntime {
         if selectedSessionID == id { loadSelectedDetail() }
     }
 
-    private func retryDictation(_ original: SessionRecord, audioURL: URL) async {
+    private func retryDictation(
+        _ original: SessionRecord,
+        audioURL: URL,
+        generation: UInt
+    ) async {
+        guard processingGate.isCurrent(generation) else { return }
         var record = original
         // Re-use the profile the take was recorded with, not the current one: the
         // owner is recovering a specific dictation, not re-running today's settings.
@@ -955,9 +1208,11 @@ final class AppRuntime {
                 channel: .microphone
             ) { stage, fraction in
                 Task { @MainActor [weak self] in
-                    self?.report(stage, fraction, kind: .dictation)
+                    self?.report(stage, fraction, kind: .dictation, generation: generation)
                 }
             }
+            try Task.checkCancellation()
+            guard processingGate.isCurrent(generation) else { throw CancellationError() }
             let text = TextCleaner.clean(tidied(result.text))
             record.title = Self.summarise(text)
             record.state = .completed
@@ -971,15 +1226,21 @@ final class AppRuntime {
                 speaker: "You", originalText: result.text, editedText: text
             )], for: record)
             try? FileManager.default.removeItem(at: audioURL)
+            finishProcessing(generation)
             phase = .idle
             copy(text, note: "Recovered and copied.")
             reloadSessions()
             selectedSessionID = record.id
+        } catch is CancellationError {
+            // The cancellation owner restores the persisted retry to a recoverable
+            // state; this stale task must not overwrite it.
         } catch {
+            guard !Task.isCancelled, processingGate.isCurrent(generation) else { return }
             record.state = .failed
             record.errorMessage = error.localizedDescription
             record.updatedAt = Date()
             try? database.updateSession(record)
+            finishProcessing(generation)
             phase = .idle
             hud.flashFailure(error.localizedDescription)
         }
@@ -1101,6 +1362,8 @@ final class AppRuntime {
             selectedDetail = nil
             playback.stop()
             try database.deleteEverything()
+            meetingChat.resetAfterErasingContent()
+            workspaceChat.resetAfterErasingContent()
             reloadSessions()
             refreshStorageSizes()
             toast.present("Everything was deleted.", tone: .success)
@@ -1117,22 +1380,77 @@ final class AppRuntime {
     // MARK: - Local AI
 
     func discoverLocalModels() {
-        localAIStatus = .checking
         let configuration = settings.payload.localAI
-        Task { [weak self] in
+        localModelDiscoveryTask?.cancel()
+        let request = localModelCatalog.begin(source: LocalModelSource(configuration: configuration))
+        localModelDiscoveryTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let discovered = try await localAI.discoverModels(configuration: configuration)
-                self.localModels = discovered
-                self.localAIStatus = .connected(models: discovered.count)
+                async let chatDiscovery = localAI.discoverModels(configuration: configuration)
+                async let embeddingDiscovery = localAI.discoverEmbeddingModels(configuration: configuration)
+                let (discovered, embeddings) = try await (chatDiscovery, embeddingDiscovery)
+                guard !Task.isCancelled,
+                      self.localModelSource == request.source,
+                      self.localModelCatalog.receive(discovered, for: request) else { return }
+                self.localEmbeddingModels = embeddings
+                self.localModelDiscoveryTask = nil
                 // Choosing the first model for the owner turns "connected but does
                 // nothing" into "ready", which is what they came here for.
                 if self.settings.payload.localAI.model.isEmpty, let first = discovered.first {
                     self.settings.payload.localAI.model = first
                 }
+                if self.settings.payload.localAI.embeddingModel.isEmpty,
+                   let first = embeddings.first {
+                    self.settings.payload.localAI.embeddingModel = first
+                }
+                self.prepareSemanticMeetingSearch()
             } catch {
-                self.localModels = []
-                self.localAIStatus = .failed(error.localizedDescription)
+                guard !Task.isCancelled, self.localModelSource == request.source else { return }
+                guard self.localModelCatalog.fail(error.localizedDescription, for: request) else { return }
+                self.localModelDiscoveryTask = nil
+            }
+        }
+    }
+
+    func prepareSemanticMeetingSearch() {
+        guard meetingSemanticIndexTask == nil else { return }
+        let configuration = settings.payload.localAI
+        guard !configuration.embeddingModel.isEmpty else {
+            meetingSemanticIndexState = .idle
+            return
+        }
+        let model = configuration.embeddingModel
+        meetingSemanticIndexTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await MeetingSemanticIndex(
+                    database: self.database,
+                    service: self.localAI
+                ).backfill(
+                    model: model,
+                    configuration: configuration,
+                    onProgress: { [weak self] completed, total in
+                        await MainActor.run {
+                            guard let self,
+                                  self.settings.payload.localAI.embeddingModel == model else { return }
+                            self.meetingSemanticIndexState = .indexing(
+                                completed: completed,
+                                total: total
+                            )
+                        }
+                    }
+                )
+                guard !Task.isCancelled,
+                      self.settings.payload.localAI.embeddingModel == model else { return }
+                let count = try self.database.meetingPassages().count
+                self.meetingSemanticIndexState = .ready(count)
+                self.meetingSemanticIndexTask = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.settings.payload.localAI.embeddingModel == model else { return }
+                self.meetingSemanticIndexState = .failed(error.localizedDescription)
+                self.meetingSemanticIndexTask = nil
             }
         }
     }
@@ -1366,16 +1684,35 @@ final class AppRuntime {
         }
     }
 
+    /// Opens the meeting behind a workspace citation and optionally starts at the
+    /// quoted passage. Loading is synchronous, so seeking here cannot race the
+    /// selection's playback setup.
+    func openMeetingSource(
+        _ source: ChatSourceRecord,
+        at passageTime: TimeInterval? = nil,
+        play: Bool
+    ) {
+        guard let sessionID = source.sessionID else { return }
+        let time = passageTime ?? source.firstPassageTime
+        searchText = ""
+        if filter != .meeting { filter = .meeting }
+        selectedSessionID = sessionID
+        playback.seek(to: time)
+        meetingSourceTarget = MeetingSourceTarget(sessionID: sessionID, time: time)
+        if play { playback.play() }
+        NotificationCenter.default.post(name: .myWhisprOpenLibrary, object: nil)
+    }
+
     private func loadSelectedDetail() {
         guard let selectedSessionID else {
             selectedDetail = nil
-            chat.reset()
+            meetingChat.reset()
             playback.stop()
             return
         }
         do {
             selectedDetail = try database.sessionDetail(id: selectedSessionID)
-            chat.load(selectedDetail)
+            meetingChat.load(selectedDetail)
             // Playback is offered for a failed or interrupted meeting too. "Did it
             // even record me?" is the first question when processing goes wrong, and
             // the audio is right there.

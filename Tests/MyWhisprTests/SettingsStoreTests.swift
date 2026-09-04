@@ -38,6 +38,21 @@ struct SettingsStoreTests {
         #expect(legacy.payload.localAI.summaryLanguage == .transcript)
     }
 
+    @Test("Embedding model survives relaunch and old settings keep exact search")
+    func persistsEmbeddingModelCompatibly() throws {
+        let suite = "MyWhisprTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.payload.localAI.embeddingModel.isEmpty)
+        store.payload.localAI.embeddingModel = "qwen3-embedding:4b"
+        #expect(SettingsStore(defaults: defaults).payload.localAI.embeddingModel == "qwen3-embedding:4b")
+
+        defaults.set(Data(#"{"localAI":{"model":"existing-model"}}"#.utf8), forKey: "settings.payload.v2")
+        #expect(SettingsStore(defaults: defaults).payload.localAI.embeddingModel.isEmpty)
+    }
+
     @Test("The two former per-workflow word lists become one shared vocabulary")
     func migratesSplitVocabularies() throws {
         let suite = "MyWhisprTests.\(UUID().uuidString)"

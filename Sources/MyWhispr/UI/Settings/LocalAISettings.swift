@@ -5,6 +5,8 @@ struct LocalAISettings: View {
 
     var body: some View {
         @Bindable var settings = runtime.settings
+        let source = runtime.localModelSource
+        let catalog = runtime.localModelCatalog.state(for: source)
 
         SettingsPane {
             Card(
@@ -19,6 +21,7 @@ struct LocalAISettings: View {
                             settings.payload.localAI.baseURL = provider.defaultBaseURL
                             settings.payload.localAI.model = ""
                             settings.payload.localAI.summaryModel = ""
+                            settings.payload.localAI.embeddingModel = ""
                         }
                     )) {
                         ForEach(LocalAIConfiguration.Provider.allCases, id: \.self) { provider in
@@ -44,29 +47,33 @@ struct LocalAISettings: View {
                 }
 
                 HStack(spacing: 10) {
-                    Button("Test connection") { runtime.discoverLocalModels() }
+                    switch catalog {
+                    case .notLoaded, .loading:
+                        StatusPill(tone: .working, label: "Checking…")
+                    case .available(let models):
+                        StatusPill(
+                            tone: models.isEmpty ? .bad : .good,
+                            label: models.isEmpty
+                                ? "No chat models available"
+                                : (models.count == 1 ? "1 model available" : "\(models.count) models available")
+                        )
+                        Button { runtime.discoverLocalModels() } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
                         .buttonStyle(.glass)
                         .controlSize(.small)
-                    switch runtime.localAIStatus {
-                    case .idle:
-                        EmptyView()
-                    case .checking:
-                        StatusPill(tone: .working, label: "Checking…")
-                    case .connected(let count):
-                        StatusPill(tone: .good, label: count == 1 ? "1 model available" : "\(count) models available")
+                        .help("Refresh models")
                     case .failed(let message):
                         StatusPill(tone: .bad, label: message)
+                        Button("Try again") { runtime.discoverLocalModels() }
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
                     }
                     Spacer()
                 }
             }
 
-            Card(
-                title: "Models",
-                footnote: runtime.localModels.isEmpty
-                    ? "Test the connection to discover what this service is serving."
-                    : nil
-            ) {
+            Card(title: "Models") {
                 SettingRow(
                     label: "Rewrite dictation with",
                     detail: "Runs in the gap before text appears, so prefer a small fast model."
@@ -78,6 +85,18 @@ struct LocalAISettings: View {
                     detail: "Used for meeting summaries and for questions about a meeting. Runs only when you ask, so a slower, stronger model is fine."
                 ) {
                     modelPicker(selection: $settings.payload.localAI.summaryModel, allowsInherit: true)
+                }
+                SettingRow(
+                    label: "Search meetings with",
+                    detail: "Adds multilingual semantic search to exact transcript matching. Embeddings stay in MyWhispr's local database."
+                ) {
+                    embeddingModelPicker(selection: $settings.payload.localAI.embeddingModel)
+                }
+                if !settings.payload.localAI.embeddingModel.isEmpty {
+                    HStack {
+                        semanticIndexStatus
+                        Spacer()
+                    }
                 }
             }
 
@@ -116,6 +135,23 @@ struct LocalAISettings: View {
                 }
             }
 
+            Card(title: "Summary instruction") {
+                TextEditor(text: $settings.payload.localAI.summaryPrompt)
+                    .font(.system(size: 12))
+                    .scrollContentBackground(.hidden)
+                    .frame(height: 90)
+                    .padding(8)
+                    .background(.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                HStack {
+                    Spacer()
+                    Button("Restore default") {
+                        settings.payload.localAI.summaryPrompt = LocalAIConfiguration.defaultSummaryPrompt
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+                }
+            }
+
             Card(title: "Rewrite instruction") {
                 TextEditor(text: $settings.payload.localAI.rewritePrompt)
                     .font(.system(size: 12))
@@ -133,31 +169,79 @@ struct LocalAISettings: View {
                 }
             }
         }
+        .task(id: source) {
+            // Address edits are persisted as they are typed. Let SwiftUI cancel
+            // superseded values so only the settled connection is queried.
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            runtime.discoverLocalModels()
+        }
     }
 
     @ViewBuilder
     private func modelPicker(selection: Binding<String>, allowsInherit: Bool) -> some View {
+        let source = runtime.localModelSource
+        let models = runtime.localModelCatalog.models(for: source)
         Picker("", selection: selection) {
             if allowsInherit {
                 Text("Same as rewrite").tag("")
             } else {
                 Text("None").tag("")
             }
-            if !runtime.localModels.isEmpty {
+            if !models.isEmpty {
                 Divider()
-                ForEach(runtime.localModels, id: \.self) { model in
+                ForEach(models, id: \.self) { model in
                     Text(model).tag(model)
                 }
             }
-            // A model chosen before the service went away must stay visible, or the
-            // picker would silently appear to reset the owner's choice.
-            if !selection.wrappedValue.isEmpty, !runtime.localModels.contains(selection.wrappedValue) {
+            if !selection.wrappedValue.isEmpty,
+               runtime.localModelCatalog.confirmsMissing(selection.wrappedValue, from: source) {
+                Divider()
+                Text("\(selection.wrappedValue) (not found)").tag(selection.wrappedValue)
+            } else if !selection.wrappedValue.isEmpty, !models.contains(selection.wrappedValue) {
+                Divider()
+                Text(selection.wrappedValue).tag(selection.wrappedValue)
+            }
+        }
+        .labelsHidden()
+        .frame(maxWidth: 220)
+    }
+
+    private func embeddingModelPicker(selection: Binding<String>) -> some View {
+        let source = runtime.localModelSource
+        let models = runtime.settings.payload.localAI.provider == .ollama
+            ? runtime.localEmbeddingModels
+            : runtime.localModelCatalog.models(for: source)
+        return Picker("", selection: selection) {
+            Text("Exact text only").tag("")
+            if !models.isEmpty {
+                Divider()
+                ForEach(models, id: \.self) { model in
+                    Text(model).tag(model)
+                }
+            }
+            if !selection.wrappedValue.isEmpty,
+               !models.contains(selection.wrappedValue) {
                 Divider()
                 Text("\(selection.wrappedValue) (not found)").tag(selection.wrappedValue)
             }
         }
         .labelsHidden()
         .frame(maxWidth: 220)
+    }
+
+    @ViewBuilder
+    private var semanticIndexStatus: some View {
+        switch runtime.meetingSemanticIndexState {
+        case .idle:
+            StatusPill(tone: .unknown, label: "Search index waiting")
+        case .indexing(let completed, let total):
+            StatusPill(tone: .working, label: "Indexing \(completed) of \(total) passages")
+        case .ready(let count):
+            StatusPill(tone: .good, label: "\(count) passages ready")
+        case .failed(let message):
+            StatusPill(tone: .bad, label: message)
+        }
     }
 }
 

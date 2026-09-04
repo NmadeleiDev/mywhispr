@@ -38,9 +38,19 @@ struct LocalAIRequest: Equatable, Sendable {
 
 protocol LocalAIClient: Sendable {
     func discoverModels() async throws -> [String]
+    /// Embedding-only models are a separate capability. They must never appear in
+    /// a chat picker, but the meeting corpus needs to discover them without
+    /// guessing from a model name.
+    func discoverEmbeddingModels() async throws -> [String]
+    func embeddingModelIdentity() async throws -> String
+    func embed(_ input: [String]) async throws -> [[Float]]
     /// Streams one answer, calling `onDelta` with each fragment in the order the
     /// server produced it. Returns when the answer is complete.
     func stream(_ request: LocalAIRequest, onDelta: @Sendable @escaping (String) async -> Void) async throws
+}
+
+extension LocalAIClient {
+    func discoverEmbeddingModels() async throws -> [String] { [] }
 }
 
 extension LocalAIClient {
@@ -66,6 +76,41 @@ actor LocalAIService {
     func discoverModels(configuration: LocalAIConfiguration) async throws -> [String] {
         try Self.validate(configuration: configuration)
         return try await client(configuration: configuration, model: configuration.model).discoverModels()
+    }
+
+    func discoverEmbeddingModels(configuration: LocalAIConfiguration) async throws -> [String] {
+        try Self.validate(configuration: configuration)
+        return try await client(
+            configuration: configuration,
+            model: configuration.embeddingModel
+        ).discoverEmbeddingModels()
+    }
+
+    func embed(
+        _ input: [String],
+        model: String,
+        configuration: LocalAIConfiguration
+    ) async throws -> [[Float]] {
+        guard !model.isEmpty else { throw LocalAIError.embeddingModelNotSelected }
+        guard !input.isEmpty else { return [] }
+        try Self.validate(configuration: configuration)
+        let vectors = try await client(configuration: configuration, model: model).embed(input)
+        guard vectors.count == input.count,
+              let dimensions = vectors.first?.count,
+              dimensions > 0,
+              vectors.allSatisfy({ $0.count == dimensions && $0.allSatisfy(\.isFinite) }) else {
+            throw LocalAIError.invalidEmbeddingResponse
+        }
+        return vectors
+    }
+
+    func embeddingModelIdentity(
+        model: String,
+        configuration: LocalAIConfiguration
+    ) async throws -> String {
+        guard !model.isEmpty else { throw LocalAIError.embeddingModelNotSelected }
+        try Self.validate(configuration: configuration)
+        return try await client(configuration: configuration, model: model).embeddingModelIdentity()
     }
 
     func rewrite(_ text: String, configuration: LocalAIConfiguration) async throws -> String {
@@ -281,12 +326,47 @@ struct OllamaClient: LocalAIClient {
     var session: URLSession = .shared
 
     func discoverModels() async throws -> [String] {
+        try await catalog().models
+            // Older Ollama versions omitted capabilities. Keep unknown custom
+            // models, but never offer one the server identifies as embedding-only.
+            .filter { $0.capabilities?.contains("completion") != false }
+            .map(\.name)
+            .sorted()
+    }
+
+    func discoverEmbeddingModels() async throws -> [String] {
+        try await catalog().models
+            .filter { $0.capabilities?.contains("embedding") == true }
+            .map(\.name)
+            .sorted()
+    }
+
+    func embeddingModelIdentity() async throws -> String {
+        let item = try await catalog().models.first(where: { $0.name == model })
+        guard let digest = item?.digest, !digest.isEmpty else { return model }
+        return "\(model)@\(digest)"
+    }
+
+    func embed(_ input: [String]) async throws -> [[Float]] {
+        var request = URLRequest(url: baseURL.appending(path: "api/embed"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 300
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(OllamaEmbeddingRequest(
+            model: model,
+            input: input,
+            truncate: false
+        ))
+        let (data, response) = try await session.data(for: request)
+        try LocalAIWire.check(response, data: data)
+        return try JSONDecoder().decode(OllamaEmbeddingResponse.self, from: data).embeddings
+    }
+
+    private func catalog() async throws -> OllamaTags {
         let url = baseURL.appending(path: "api/tags")
         let (data, response) = try await session.data(from: url)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            throw LocalAIError.invalidResponse
-        }
-        return try JSONDecoder().decode(OllamaTags.self, from: data).models.map(\.name).sorted()
+        try LocalAIWire.check(response, data: data)
+        return try JSONDecoder().decode(OllamaTags.self, from: data)
     }
 
     func stream(_ request: LocalAIRequest, onDelta: @Sendable @escaping (String) async -> Void) async throws {
@@ -333,6 +413,21 @@ struct OpenAICompatibleLocalClient: LocalAIClient {
             throw LocalAIError.invalidResponse
         }
         return try JSONDecoder().decode(OpenAIModels.self, from: data).data.map(\.id).sorted()
+    }
+
+    func embeddingModelIdentity() async throws -> String { model }
+
+    func embed(_ input: [String]) async throws -> [[Float]] {
+        var request = URLRequest(url: endpoint("embeddings"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 300
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(OpenAIEmbeddingRequest(model: model, input: input))
+        let (data, response) = try await session.data(for: request)
+        try LocalAIWire.check(response, data: data)
+        return try JSONDecoder().decode(OpenAIEmbeddingResponse.self, from: data).data
+            .sorted { $0.index < $1.index }
+            .map(\.embedding)
     }
 
     func stream(_ request: LocalAIRequest, onDelta: @Sendable @escaping (String) async -> Void) async throws {
@@ -384,6 +479,13 @@ struct OpenAICompatibleLocalClient: LocalAIClient {
 /// and every one of those arrives as a status code with an explanation in the body.
 /// Throwing "invalid response" would discard exactly the part worth reading.
 enum LocalAIWire {
+    static func check(_ response: URLResponse, data: Data) throws {
+        guard let http = response as? HTTPURLResponse else { throw LocalAIError.invalidResponse }
+        guard !(200..<300).contains(http.statusCode) else { return }
+        let body = String(data: data.prefix(800), encoding: .utf8) ?? ""
+        throw LocalAIError.server(message(from: body, status: http.statusCode))
+    }
+
     static func check(_ response: URLResponse, bytes: URLSession.AsyncBytes) async throws {
         guard let http = response as? HTTPURLResponse else { throw LocalAIError.invalidResponse }
         guard !(200..<300).contains(http.statusCode) else { return }
@@ -428,7 +530,10 @@ enum LocalAIError: LocalizedError, Equatable {
     case invalidEndpoint
     case nonLocalEndpoint
     case modelNotSelected
+    case embeddingModelNotSelected
     case invalidResponse
+    case invalidEmbeddingResponse
+    case invalidCitations
     case invalidSummaryResponse
     case rewriteDivergedFromSpeech
     case timedOut
@@ -440,7 +545,10 @@ enum LocalAIError: LocalizedError, Equatable {
         case .invalidEndpoint: "Enter a valid HTTP or HTTPS local model endpoint."
         case .nonLocalEndpoint: "Only loopback model servers are allowed unless LAN access is enabled."
         case .modelNotSelected: "Select a local language model first."
+        case .embeddingModelNotSelected: "Select a local embedding model for semantic meeting search."
         case .invalidResponse: "The local model server returned an invalid response."
+        case .invalidEmbeddingResponse: "The local model returned invalid search embeddings."
+        case .invalidCitations: "The local model cited meeting evidence that was not provided. Ask again to generate a grounded answer."
         case .invalidSummaryResponse: "The local model did not return a usable title and summary. Try again."
         case .rewriteDivergedFromSpeech: "The local model rewrote the dictation instead of tidying it."
         case .timedOut: "The local model did not answer in time."
@@ -453,7 +561,11 @@ enum LocalAIError: LocalizedError, Equatable {
 // MARK: - Wire types
 
 private struct OllamaTags: Decodable {
-    struct Model: Decodable { let name: String }
+    struct Model: Decodable {
+        let name: String
+        let digest: String?
+        let capabilities: [String]?
+    }
     let models: [Model]
 }
 
@@ -481,6 +593,16 @@ private struct OllamaChatChunk: Decodable {
     let error: String?
 }
 
+private struct OllamaEmbeddingRequest: Encodable {
+    let model: String
+    let input: [String]
+    let truncate: Bool
+}
+
+private struct OllamaEmbeddingResponse: Decodable {
+    let embeddings: [[Float]]
+}
+
 private struct OpenAIModels: Decodable {
     struct Model: Decodable { let id: String }
     let data: [Model]
@@ -497,4 +619,18 @@ private struct OpenAIChatChunk: Decodable {
     struct Delta: Decodable { let content: String? }
     struct Choice: Decodable { let delta: Delta }
     let choices: [Choice]
+}
+
+
+private struct OpenAIEmbeddingRequest: Encodable {
+    let model: String
+    let input: [String]
+}
+
+private struct OpenAIEmbeddingResponse: Decodable {
+    struct Item: Decodable {
+        let index: Int
+        let embedding: [Float]
+    }
+    let data: [Item]
 }

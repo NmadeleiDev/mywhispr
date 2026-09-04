@@ -16,12 +16,15 @@ final class MeetingPlaybackController {
     func load(directoryURL: URL) throws {
         stop()
         let microphone = try AVAudioPlayer(contentsOf: directoryURL.appending(path: "microphone.caf"))
-        let system = try AVAudioPlayer(contentsOf: directoryURL.appending(path: "system.caf"))
         microphone.prepareToPlay()
-        system.prepareToPlay()
         microphonePlayer = microphone
-        systemPlayer = system
-        duration = max(microphone.duration, system.duration)
+        let systemURL = directoryURL.appending(path: "system.caf")
+        if FileManager.default.fileExists(atPath: systemURL.path) {
+            let system = try AVAudioPlayer(contentsOf: systemURL)
+            system.prepareToPlay()
+            systemPlayer = system
+        }
+        duration = max(microphone.duration, systemPlayer?.duration ?? 0)
         currentTime = 0
     }
 
@@ -30,11 +33,11 @@ final class MeetingPlaybackController {
     }
 
     func play() {
-        guard let microphonePlayer, let systemPlayer else { return }
+        guard let microphonePlayer else { return }
         if currentTime >= duration { seek(to: 0) }
-        let deviceTime = max(microphonePlayer.deviceCurrentTime, systemPlayer.deviceCurrentTime) + 0.05
+        let deviceTime = max(microphonePlayer.deviceCurrentTime, systemPlayer?.deviceCurrentTime ?? 0) + 0.05
         microphonePlayer.play(atTime: deviceTime)
-        systemPlayer.play(atTime: deviceTime)
+        systemPlayer?.play(atTime: deviceTime)
         isPlaying = true
         startTicker()
     }

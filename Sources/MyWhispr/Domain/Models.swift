@@ -223,16 +223,35 @@ struct TranscriptSegmentRecord: Codable, FetchableRecord, PersistableRecord, Ide
     var editedText: String
 }
 
-/// One turn of a conversation about a meeting.
+/// The recordings one conversation is allowed to read.
 ///
-/// Stored beside the transcript rather than held in memory, because a question worth
-/// asking is worth still having an answer to tomorrow — and because re-asking it
-/// means the model reads the whole meeting again.
+/// Scope is a sum type rather than a nullable meeting identifier: there is no third
+/// state where a conversation is neither about one meeting nor about the corpus.
+enum ConversationScope: Hashable, Sendable {
+    case meeting(UUID)
+    case allMeetings
+
+    static let allMeetingsID = "all-meetings"
+
+    var conversationID: String {
+        switch self {
+        case .meeting(let id): id.uuidString
+        case .allMeetings: Self.allMeetingsID
+        }
+    }
+
+    var meetingID: UUID? {
+        if case .meeting(let id) = self { return id }
+        return nil
+    }
+}
+
+/// One turn of a conversation about one meeting or the meeting corpus.
 struct ChatMessageRecord: Codable, FetchableRecord, PersistableRecord, Identifiable, Equatable, Sendable {
     static let databaseTableName = "chatMessages"
 
     var id: UUID
-    var sessionID: UUID
+    var conversationID: String
     var position: Int
     /// Only ever `user` or `assistant`. The system message is derived from the
     /// transcript and the owner's instruction at the moment of asking, so storing it
@@ -240,9 +259,122 @@ struct ChatMessageRecord: Codable, FetchableRecord, PersistableRecord, Identifia
     var role: LocalAIMessage.Role
     var content: String
     var createdAt: Date
+
+    init(
+        id: UUID,
+        conversationID: String,
+        position: Int,
+        role: LocalAIMessage.Role,
+        content: String,
+        createdAt: Date
+    ) {
+        self.id = id
+        self.conversationID = conversationID
+        self.position = position
+        self.role = role
+        self.content = content
+        self.createdAt = createdAt
+    }
+
+    /// Compatibility convenience for the single-meeting conversation call sites.
+    init(
+        id: UUID,
+        sessionID: UUID,
+        position: Int,
+        role: LocalAIMessage.Role,
+        content: String,
+        createdAt: Date
+    ) {
+        self.init(
+            id: id,
+            conversationID: ConversationScope.meeting(sessionID).conversationID,
+            position: position,
+            role: role,
+            content: content,
+            createdAt: createdAt
+        )
+    }
 }
 
 extension LocalAIMessage.Role: DatabaseValueConvertible {}
+
+/// One passage admitted by retrieval before passages are grouped into meetings.
+struct MeetingPassageEvidence: Identifiable, Equatable, Sendable {
+    var id: String
+    var sessionID: UUID
+    var title: String
+    var startedAt: Date
+    var summary: String?
+    var start: TimeInterval
+    var end: TimeInterval
+    var text: String
+    var speakers: String = ""
+}
+
+/// The evidence from one meeting that a workspace answer is allowed to cite.
+///
+/// Passage ranking remains internal to retrieval. Everything beyond that boundary
+/// receives meetings, so a single recording cannot become several visible sources.
+struct MeetingEvidence: Identifiable, Equatable, Sendable {
+    var id: UUID { sessionID }
+    var sessionID: UUID
+    var title: String
+    var startedAt: Date
+    var summary: String?
+    var passages: [MeetingPassageEvidence]
+
+    var sourceLabel: String {
+        let date = startedAt.formatted(.dateTime.year().month(.abbreviated).day())
+        return "\(title) · \(date)"
+    }
+}
+
+/// One retained transcript passage inside a durable meeting source.
+struct ChatSourcePassage: Identifiable, Equatable, Sendable {
+    var id: String
+    var position: Int
+    var start: TimeInterval
+    var end: TimeInterval
+    var text: String
+    var speakers: String
+}
+
+/// A durable snapshot of one meeting cited by one assistant turn.
+///
+/// `sessionID` becomes nil if its meeting is deleted. The answer and its quoted
+/// evidence remain readable, but the UI can truthfully disable Open and Play.
+struct ChatSourceRecord: Identifiable, Equatable, Sendable {
+    var id: String
+    var messageID: UUID
+    var position: Int
+    /// Immutable identity of the meeting that was cited. Unlike `sessionID`, this
+    /// survives deletion and keeps the one-source-per-meeting invariant enforceable.
+    var meetingID: String
+    var sessionID: UUID?
+    var title: String
+    var startedAt: Date
+    var summary: String?
+    var passages: [ChatSourcePassage]
+
+    var sourceLabel: String {
+        let date = startedAt.formatted(.dateTime.year().month(.abbreviated).day())
+        return "\(title) · \(date)"
+    }
+
+    var summaryText: String? {
+        let value = summary?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    var firstPassageTime: TimeInterval { passages.first?.start ?? 0 }
+}
+
+/// A fresh navigation request even when the owner opens the same cited moment twice.
+struct MeetingSourceTarget: Equatable, Sendable {
+    var id = UUID()
+    var sessionID: UUID
+    var time: TimeInterval
+}
 
 struct SessionDetail: Sendable {
     var session: SessionRecord

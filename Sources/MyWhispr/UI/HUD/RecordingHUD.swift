@@ -170,7 +170,7 @@ struct RecordingHUD: View {
                 //
                 // A meeting asks first. Cancelling a dictation forfeits a sentence
                 // that can be said again; cancelling a meeting forfeits the only
-                // transcription pass over an hour of audio, from a control that has
+                // recording and transcript for an hour of audio, from a control that has
                 // been sitting under the pointer at the bottom of the screen for
                 // however long the pass has been running. One stray click should not
                 // be able to spend that.
@@ -239,7 +239,9 @@ struct RecordingHUD: View {
             }
         }
         .buttonStyle(.plain)
-        .help(confirmingDiscard ? "Discard this transcription" : "Stop")
+        .frame(minWidth: 52, minHeight: 24)
+        .contentShape(Rectangle())
+        .help(confirmingDiscard ? "Discard this meeting and recording" : "Stop")
         // The question expires rather than latching: an unanswered "Discard?" left on
         // screen would become the one-click destructive button it exists to prevent.
         .task(id: confirmingDiscard) {

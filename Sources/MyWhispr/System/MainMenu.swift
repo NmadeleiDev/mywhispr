@@ -4,6 +4,9 @@ extension Notification.Name {
     /// Posted by Edit ▸ Find. The main window's search field listens for it, which
     /// keeps the menu item working without the menu knowing anything about views.
     static let myWhisprFocusSearch = Notification.Name("app.mywhispr.mac.focusSearch")
+    /// Routes a durable chat source into the Library without coupling the answer
+    /// renderer to the main window's private navigation state.
+    static let myWhisprOpenLibrary = Notification.Name("app.mywhispr.mac.openLibrary")
 }
 
 /// Builds and installs the application's main menu.

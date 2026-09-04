@@ -34,9 +34,11 @@ struct LocalAIClientTests {
     func summaryPromptIncludesLanguage() throws {
         var configuration = LocalAIConfiguration()
         configuration.summaryLanguage = .ru
+        configuration.summaryPrompt = "Focus on unresolved risks."
         let messages = LocalAIService.summaryMessages("Transcript", configuration: configuration)
 
         let instruction = try #require(messages.first?.content)
+        #expect(instruction.contains("Focus on unresolved risks."))
         #expect(instruction.contains("Write both the title and the summary in Russian."))
         #expect(instruction.contains("Do not use LaTeX or dollar-delimited math."))
         #expect(instruction.contains("<title>"))
@@ -51,6 +53,49 @@ struct LocalAIClientTests {
             session: session
         )
         #expect(try await client.discoverModels() == ["gemma3:4b", "qwen3:4b"])
+    }
+
+    @Test func ollamaDoesNotOfferEmbeddingOnlyModelsForTextGeneration() async throws {
+        let session = makeSession(
+            status: 200,
+            body: #"{"models":[{"name":"qwen3:4b","capabilities":["completion","tools"]},{"name":"qwen3-embedding:4b","capabilities":["embedding"]}]}"#
+        )
+        let client = OllamaClient(
+            baseURL: URL(string: "http://127.0.0.1:11434")!,
+            model: "qwen3:4b",
+            session: session
+        )
+
+        #expect(try await client.discoverModels() == ["qwen3:4b"])
+        #expect(try await client.discoverEmbeddingModels() == ["qwen3-embedding:4b"])
+    }
+
+    @Test func ollamaGeneratesBatchEmbeddings() async throws {
+        let session = makeSession(
+            status: 200,
+            body: #"{"model":"embed","embeddings":[[0.5,0.25],[0.1,0.9]]}"#
+        )
+        let client = OllamaClient(
+            baseURL: URL(string: "http://127.0.0.1:11434")!,
+            model: "embed",
+            session: session
+        )
+
+        #expect(try await client.embed(["one", "two"]) == [[0.5, 0.25], [0.1, 0.9]])
+    }
+
+    @Test func openAIGeneratesEmbeddingsInServerIndexOrder() async throws {
+        let session = makeSession(
+            status: 200,
+            body: #"{"data":[{"index":1,"embedding":[0.1,0.9]},{"index":0,"embedding":[0.5,0.25]}]}"#
+        )
+        let client = OpenAICompatibleLocalClient(
+            baseURL: URL(string: "http://localhost:1234")!,
+            model: "embed",
+            session: session
+        )
+
+        #expect(try await client.embed(["one", "two"]) == [[0.5, 0.25], [0.1, 0.9]])
     }
 
     @Test func openAICompatibleCompletes() async throws {

@@ -4,13 +4,14 @@ import SwiftUI
 ///
 /// Rows lead with the content itself — the words that were said, or the meeting's
 /// name — because that is what the owner is scanning for. Metadata sits underneath
-/// in a quieter tier, and processing state only appears when it is not the boring
+/// in a quieter tier, and active status only appears when it is not the boring
 /// answer, so a healthy list is pure content with no status noise.
 struct SessionList: View {
     var sessions: [SessionRecord]
     var kind: WorkflowKind
     @Binding var selection: UUID?
     var searchText: String
+    var summaryGenerationSessionID: UUID?
     var onDelete: (UUID) -> Void
 
     var body: some View {
@@ -18,7 +19,12 @@ struct SessionList: View {
             ForEach(groups, id: \.title) { group in
                 Section(group.title) {
                     ForEach(group.sessions) { session in
-                        SessionRow(session: session)
+                        SessionRow(
+                            session: session,
+                            isSelected: selection == session.id,
+                            isGeneratingSummary: summaryGenerationSessionID == session.id,
+                            onDelete: { onDelete(session.id) }
+                        )
                             .tag(session.id)
                             .contextMenu {
                                 Button("Delete", role: .destructive) { onDelete(session.id) }
@@ -44,18 +50,18 @@ struct SessionList: View {
     @ViewBuilder
     private var emptyState: some View {
         if !searchText.isEmpty {
-            EmptyStateView(icon: "magnifyingglass", message: "Nothing matches “\(searchText)”.")
+            EmptyStateView(icon: "magnifyingglass", message: "No matches")
         } else {
             switch kind {
             case .dictation:
                 EmptyStateView(
                     icon: "waveform",
-                    message: "Hold the dictation key in any text field and speak. What you say lands here."
+                    message: "No dictations yet"
                 )
             case .meeting:
                 EmptyStateView(
                     icon: "person.wave.2",
-                    message: "Recorded meetings and their transcripts live here."
+                    message: "No meetings yet"
                 )
             }
         }
@@ -91,8 +97,37 @@ struct SessionList: View {
     }
 }
 
+enum SessionRowStatus: Equatable {
+    case recording
+    case processing
+    case writingNotes
+    case failed
+    case interrupted
+
+    init?(sessionState: SessionState, isGeneratingSummary: Bool) {
+        switch sessionState {
+        case .completed:
+            guard isGeneratingSummary else { return nil }
+            self = .writingNotes
+        case .recording:
+            self = .recording
+        case .processing:
+            self = .processing
+        case .failed:
+            self = .failed
+        case .interrupted:
+            self = .interrupted
+        }
+    }
+}
+
 struct SessionRow: View {
     var session: SessionRecord
+    var isSelected = false
+    var isGeneratingSummary = false
+    var onDelete: () -> Void = {}
+
+    @State private var hovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -102,14 +137,29 @@ struct SessionRow: View {
                     .lineLimit(2)
                     .foregroundStyle(session.state == .completed ? .primary : .secondary)
                 Spacer(minLength: 4)
+                Menu {
+                    Button("Delete", role: .destructive, action: onDelete)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 18, height: 18)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .opacity(isSelected || hovered ? 1 : 0)
+                .help("Meeting actions")
+            }
+            HStack(spacing: 8) {
+                Text(metadata)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
                 stateBadge
             }
-            Text(metadata)
-                .font(.system(size: 11))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
+            .font(.system(size: 11))
         }
         .padding(.vertical, 3)
+        .onHover { hovered = $0 }
     }
 
     private var displayTitle: String {
@@ -129,23 +179,41 @@ struct SessionRow: View {
     /// list stays quiet when everything is fine.
     @ViewBuilder
     private var stateBadge: some View {
-        switch session.state {
-        case .completed:
-            EmptyView()
-        case .recording:
-            Image(systemName: "record.circle")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Palette.accent)
-        case .processing:
-            ProgressView().controlSize(.mini)
-        case .failed:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Palette.danger)
-        case .interrupted:
-            Image(systemName: "arrow.trianglehead.counterclockwise")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Palette.accent)
+        if let status = SessionRowStatus(
+            sessionState: session.state,
+            isGeneratingSummary: isGeneratingSummary
+        ) {
+            Group {
+                switch status {
+                case .writingNotes:
+                    HStack(spacing: 4) {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(Palette.accent)
+                        Text("Writing notes")
+                    }
+                    .foregroundStyle(Palette.accent)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Writing meeting notes")
+                case .recording:
+                    Label("Recording", systemImage: "record.circle")
+                        .foregroundStyle(Palette.accent)
+                case .processing:
+                    HStack(spacing: 4) {
+                        ProgressView().controlSize(.mini)
+                        Text("Processing")
+                    }
+                case .failed:
+                    Label("Needs recovery", systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Palette.danger)
+                case .interrupted:
+                    Label("Needs recovery", systemImage: "arrow.trianglehead.counterclockwise")
+                        .foregroundStyle(Palette.accent)
+                }
+            }
+            .font(.system(size: 9, weight: .medium))
+            .lineLimit(1)
+            .fixedSize()
         }
     }
 }

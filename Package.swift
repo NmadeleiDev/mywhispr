@@ -29,7 +29,10 @@ let package = Package(
         ),
         .testTarget(
             name: "MyWhisprTests",
-            dependencies: ["MyWhispr"]
+            dependencies: [
+                "MyWhispr",
+                .product(name: "GRDB", package: "GRDB.swift"),
+            ]
         ),
     ]
 )

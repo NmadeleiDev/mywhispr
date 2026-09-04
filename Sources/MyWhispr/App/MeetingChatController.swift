@@ -2,17 +2,18 @@ import Foundation
 import Observation
 import OSLog
 
-/// The conversation about one meeting.
+/// One conversation, explicitly scoped to a meeting or to the meeting corpus.
 ///
 /// Owned by ``AppRuntime`` the way playback and the HUD are: it holds state that
-/// belongs to a meeting rather than to a view, so switching to another meeting and
-/// back finds the conversation where it was left, and closing the window does not
-/// throw away an answer that took a minute to write.
+/// belongs to a conversation rather than to a view, so switching to another meeting
+/// and back finds the conversation where it was left, and closing the window does
+/// not throw away an answer that took a minute to write.
 @MainActor
 @Observable
-final class MeetingChatController {
-    private(set) var sessionID: UUID?
+final class ConversationController {
+    private(set) var scope: ConversationScope?
     private(set) var messages: [ChatMessageRecord] = []
+    private(set) var sourcesByMessageID: [UUID: [ChatSourceRecord]] = [:]
     /// The answer being written right now, as far as it has got.
     private(set) var streamingAnswer: String?
     /// The request is out but nothing has come back yet. On a long meeting this is
@@ -20,6 +21,7 @@ final class MeetingChatController {
     /// nothing happening unless it is said.
     private(set) var isReading = false
     private(set) var errorMessage: String?
+    private(set) var searchNotice: String?
     /// Size of the transcript the model is given, in tokens, so the interface can
     /// say when it will not fit rather than letting the server quietly drop half of it.
     private(set) var transcriptTokens = 0
@@ -28,6 +30,7 @@ final class MeetingChatController {
 
     private weak var runtime: AppRuntime?
     private var transcript = ""
+    private var evidence: [MeetingEvidence] = []
     private var task: Task<Void, Never>?
     /// Bumped whenever an in-flight answer is abandoned rather than stopped, so a
     /// task that is still unwinding cannot write its leftovers over the one that
@@ -51,11 +54,17 @@ final class MeetingChatController {
 
     var isBusy: Bool { task != nil }
 
+    var sessionID: UUID? { scope?.meetingID }
+
     var canSend: Bool {
-        !isBusy && sessionID != nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !isBusy && scope != nil && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     var isEmpty: Bool { messages.isEmpty && streamingAnswer == nil }
+
+    func sources(for messageID: UUID) -> [ChatSourceRecord] {
+        sourcesByMessageID[messageID] ?? []
+    }
 
     /// A question was asked and never answered — the app was quit mid-answer, or the
     /// server refused. The question is still there; only the answer is missing.
@@ -65,13 +74,32 @@ final class MeetingChatController {
 
     /// What the model is about to be sent, so both the size warning and the request
     /// itself are derived from exactly the same thing.
-    private var prompt: [LocalAIMessage] {
+    private func prompt(
+        context: MeetingChatRequestContext,
+        workspaceEvidence: [MeetingEvidence]? = nil,
+        retrieval: MeetingRetrievalResult? = nil
+    ) -> [LocalAIMessage] {
         guard let runtime else { return [] }
-        return MeetingChatPrompt.messages(
-            instruction: runtime.settings.payload.localAI.chatPrompt,
-            transcript: transcript,
-            history: messages.map { LocalAIMessage(role: $0.role, content: $0.content) }
-        )
+        let history = messages.map { LocalAIMessage(role: $0.role, content: $0.content) }
+        switch scope {
+        case .meeting:
+            return MeetingChatPrompt.messages(
+                instruction: runtime.settings.payload.localAI.chatPrompt,
+                transcript: transcript,
+                history: history,
+                context: context
+            )
+        case .allMeetings:
+            return MeetingChatPrompt.workspaceMessages(
+                instruction: runtime.settings.payload.localAI.chatPrompt,
+                evidence: workspaceEvidence ?? evidence,
+                history: history,
+                context: context,
+                retrieval: retrieval
+            )
+        case nil:
+            return []
+        }
     }
 
     /// What the whole conversation costs, measured without concatenating it.
@@ -91,7 +119,7 @@ final class MeetingChatController {
     /// confident answer drawn from part of the meeting, which is indistinguishable
     /// from a correct one until it matters.
     var contextWarning: String? {
-        guard let runtime, sessionID != nil, transcriptTokens > 0 else { return nil }
+        guard let runtime, scope != nil, transcriptTokens > 0 else { return nil }
         let configuration = runtime.settings.payload.localAI
         let size = TokenBudget.describe(transcriptTokens)
         switch configuration.provider {
@@ -122,13 +150,16 @@ final class MeetingChatController {
             reset()
             return
         }
-        if detail.session.id != sessionID {
+        let nextScope = ConversationScope.meeting(detail.session.id)
+        if nextScope != scope {
             cancel()
             draft = ""
             errorMessage = nil
+            searchNotice = nil
             streamingAnswer = nil
-            sessionID = detail.session.id
-            messages = (try? runtime?.database.chatMessages(for: detail.session.id)) ?? []
+            scope = nextScope
+            messages = (try? runtime?.database.chatMessages(for: nextScope)) ?? []
+            loadSources(for: nextScope)
         }
         // The transcript is re-read even mid-answer, because editing a passage while
         // reading the answer is a reasonable thing to do and the next question should
@@ -137,14 +168,33 @@ final class MeetingChatController {
         transcriptTokens = TokenBudget.estimate(transcript)
     }
 
+    func loadWorkspace() {
+        let nextScope = ConversationScope.allMeetings
+        guard scope != nextScope else { return }
+        cancel()
+        scope = nextScope
+        transcript = ""
+        evidence = []
+        transcriptTokens = 0
+        messages = (try? runtime?.database.chatMessages(for: nextScope)) ?? []
+        loadSources(for: nextScope)
+        draft = ""
+        errorMessage = nil
+        searchNotice = nil
+        streamingAnswer = nil
+    }
+
     func reset() {
         cancel()
-        sessionID = nil
+        scope = nil
         messages = []
+        sourcesByMessageID = [:]
         transcript = ""
         transcriptTokens = 0
+        evidence = []
         streamingAnswer = nil
         errorMessage = nil
+        searchNotice = nil
         draft = ""
     }
 
@@ -153,12 +203,14 @@ final class MeetingChatController {
     func send() {
         let question = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty else { return }
-        draft = ""
+        let messageCount = messages.count
         ask(question)
+        // Keep the owner's words in the field until the database accepted them.
+        // If persistence fails, they can retry without reconstructing the question.
+        if messages.count > messageCount { draft = "" }
     }
 
     func send(_ question: String) {
-        draft = ""
         ask(question)
     }
 
@@ -177,35 +229,56 @@ final class MeetingChatController {
     }
 
     func clear() {
-        guard let sessionID, let runtime else { return }
+        guard let scope, let runtime else { return }
         cancel()
         do {
-            try runtime.database.deleteChatMessages(for: sessionID)
+            try runtime.database.deleteChatMessages(for: scope)
             messages = []
+            sourcesByMessageID = [:]
+            evidence = []
+            if scope == .allMeetings { transcriptTokens = 0 }
             streamingAnswer = nil
             errorMessage = nil
+            searchNotice = nil
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    private func ask(_ question: String?) {
-        guard let runtime, let sessionID, task == nil else { return }
+    /// Clears volatile state after the owner erases stored content.
+    func resetAfterErasingContent() {
+        let retainedScope = scope
+        cancel()
+        messages = []
+        sourcesByMessageID = [:]
+        evidence = []
+        transcript = ""
+        transcriptTokens = 0
+        streamingAnswer = nil
         errorMessage = nil
+        searchNotice = nil
+        draft = ""
+        scope = retainedScope == .allMeetings ? .allMeetings : nil
+    }
+
+    private func ask(_ question: String?) {
+        guard let runtime, let scope, task == nil else { return }
+        errorMessage = nil
+        searchNotice = nil
         streamingAnswer = nil
         pending = ""
 
         if let question {
             let record = ChatMessageRecord(
                 id: UUID(),
-                sessionID: sessionID,
+                conversationID: scope.conversationID,
                 position: (messages.last?.position ?? -1) + 1,
                 role: .user,
                 content: question,
                 createdAt: Date()
             )
             do {
-                try runtime.database.appendChatMessage(record)
+                try runtime.database.appendChatMessage(record, scope: scope)
             } catch {
                 errorMessage = error.localizedDescription
                 return
@@ -214,14 +287,77 @@ final class MeetingChatController {
         }
 
         let configuration = runtime.settings.payload.localAI
-        let request = prompt
-        let contextTokens = TokenBudget.context(for: request, limit: configuration.maxContextTokens)
+        if scope == .allMeetings, !configuration.embeddingModel.isEmpty {
+            runtime.prepareSemanticMeetingSearch()
+        }
+        let requestContext = MeetingChatRequestContext(now: Date(), timeZone: .current)
         let service = runtime.localAI
+        let database = runtime.database
         let generation = generation
+        let currentQuestion = messages.last(where: { $0.role == .user })?.content ?? ""
+        let earlierMessages = messages.last?.role == .user ? Array(messages.dropLast()) : messages
 
         isReading = true
         task = Task { [weak self] in
             do {
+                let requestEvidence: [MeetingEvidence]
+                let retrieval: MeetingRetrievalResult?
+                let semantic: MeetingSemanticSearchResult?
+                if scope == .allMeetings {
+                    let plan = MeetingQueryPlanner.plan(
+                        question: currentQuestion,
+                        history: earlierMessages,
+                        context: requestContext
+                    )
+                    if configuration.embeddingModel.isEmpty {
+                        semantic = nil
+                    } else {
+                        semantic = try await MeetingSemanticIndex(
+                            database: database,
+                            service: service
+                        ).rankedPassageIDs(
+                            for: plan,
+                            model: configuration.embeddingModel,
+                            configuration: configuration
+                        )
+                    }
+                    let result = try MeetingCorpus(database: database).retrieve(
+                        plan: plan,
+                        densePassageIDs: semantic?.passageIDs ?? [],
+                        tokenLimit: configuration.maxContextTokens
+                    )
+                    requestEvidence = result.evidence
+                    retrieval = result
+                } else {
+                    requestEvidence = []
+                    retrieval = nil
+                    semantic = nil
+                }
+                try Task.checkCancellation()
+                guard let request = await MainActor.run(body: { [weak self] () -> [LocalAIMessage]? in
+                    guard let self, generation == self.generation else { return nil }
+                    if scope == .allMeetings {
+                        self.evidence = requestEvidence
+                        if let semantic,
+                           semantic.indexedPassages < semantic.eligiblePassages {
+                            self.searchNotice = "Semantic search is preparing \(semantic.indexedPassages) of \(semantic.eligiblePassages) passages. Exact transcript search was available for this answer."
+                        } else {
+                            self.searchNotice = nil
+                        }
+                        self.transcriptTokens = requestEvidence.reduce(0) { total, meeting in
+                            total + meeting.passages.reduce(0) { $0 + TokenBudget.estimate($1.text) }
+                        }
+                    }
+                    return self.prompt(
+                        context: requestContext,
+                        workspaceEvidence: requestEvidence,
+                        retrieval: retrieval
+                    )
+                }) else { return }
+                let contextTokens = TokenBudget.context(
+                    for: request,
+                    limit: configuration.maxContextTokens
+                )
                 try await service.answer(
                     request,
                     contextTokens: contextTokens,
@@ -231,11 +367,33 @@ final class MeetingChatController {
                         await MainActor.run { self?.receive(delta, generation: generation) }
                     }
                 )
-                await MainActor.run { self?.finish(generation, for: sessionID, stopped: false) }
+                await MainActor.run {
+                    self?.finish(
+                        generation,
+                        for: scope,
+                        stopped: false,
+                        requestEvidence: requestEvidence
+                    )
+                }
             } catch is CancellationError {
-                await MainActor.run { self?.finish(generation, for: sessionID, stopped: true) }
+                await MainActor.run {
+                    self?.finish(
+                        generation,
+                        for: scope,
+                        stopped: true,
+                        requestEvidence: []
+                    )
+                }
             } catch {
-                await MainActor.run { self?.finish(generation, for: sessionID, stopped: false, error: error) }
+                await MainActor.run {
+                    self?.finish(
+                        generation,
+                        for: scope,
+                        stopped: false,
+                        requestEvidence: [],
+                        error: error
+                    )
+                }
             }
         }
     }
@@ -259,7 +417,13 @@ final class MeetingChatController {
         pending = ""
     }
 
-    private func finish(_ generation: Int, for sessionID: UUID, stopped: Bool, error: (any Error)? = nil) {
+    private func finish(
+        _ generation: Int,
+        for scope: ConversationScope,
+        stopped: Bool,
+        requestEvidence: [MeetingEvidence],
+        error: (any Error)? = nil
+    ) {
         guard generation == self.generation else { return }
         task = nil
         isReading = false
@@ -273,7 +437,16 @@ final class MeetingChatController {
         // still belongs to the meeting it was asked about, so it is stored there
         // rather than shown against whatever is on screen now.
         if !answer.isEmpty {
-            store(answer, for: sessionID)
+            if scope == .allMeetings,
+               MeetingChatPrompt.hasInvalidCitations(in: answer, evidence: requestEvidence) {
+                errorMessage = LocalAIError.invalidCitations.localizedDescription
+                logger.error("Workspace answer contained a citation outside its evidence package.")
+                return
+            }
+            let cited = scope == .allMeetings
+                ? MeetingChatPrompt.citedEvidence(in: answer, evidence: requestEvidence)
+                : []
+            store(answer, for: scope, evidence: cited)
         }
 
         if let error {
@@ -288,28 +461,40 @@ final class MeetingChatController {
         }
     }
 
-    private func store(_ answer: String, for sessionID: UUID) {
+    private func store(_ answer: String, for scope: ConversationScope, evidence: [MeetingEvidence]) {
         guard let runtime else { return }
         let position: Int
-        if sessionID == self.sessionID {
+        if scope == self.scope {
             position = (messages.last?.position ?? -1) + 1
         } else {
-            position = ((try? runtime.database.chatMessages(for: sessionID))?.last?.position ?? -1) + 1
+            position = ((try? runtime.database.chatMessages(for: scope))?.last?.position ?? -1) + 1
         }
         let record = ChatMessageRecord(
             id: UUID(),
-            sessionID: sessionID,
+            conversationID: scope.conversationID,
             position: position,
             role: .assistant,
             content: answer,
             createdAt: Date()
         )
         do {
-            try runtime.database.appendChatMessage(record)
-            if sessionID == self.sessionID { messages.append(record) }
+            let storedSources = try runtime.database.appendAssistantMessage(
+                record,
+                scope: scope,
+                evidence: evidence
+            )
+            if scope == self.scope {
+                messages.append(record)
+                sourcesByMessageID[record.id] = storedSources
+            }
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func loadSources(for scope: ConversationScope) {
+        let sources = (try? runtime?.database.chatSources(for: scope)) ?? []
+        sourcesByMessageID = Dictionary(grouping: sources, by: \.messageID)
     }
 
     private func cancel() {

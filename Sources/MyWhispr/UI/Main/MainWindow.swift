@@ -5,35 +5,63 @@ enum WindowID {
     static let setup = "setup"
 }
 
-/// The app's main window: a list of what you have said, and the detail of one item.
-///
-/// The two workflows the owner thinks in — dictation and meetings — are the top
-/// level choice, named in their words. There is no "sessions" concept on screen even
-/// though both share a storage type, because collapsing them would ask the owner to
-/// learn the database's vocabulary instead of using their own.
+/// The quiet front door to MyWhispr's three jobs: dictate, record, and ask.
 struct MainWindow: View {
     @Environment(AppRuntime.self) private var runtime
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var searchFocused: Bool
+    @Namespace private var workspaceTransition
+    @State private var destination = Destination.home
+    @State private var showingWorkspaceConversation = false
+    @State private var confirmingWorkspaceClear = false
     /// A meeting owns irreplaceable audio, so its deletion is confirmed. A dictation
     /// is text that can be spoken again, so it is not — asking every time would
     /// train the owner to dismiss the question that matters.
     @State private var meetingPendingDeletion: SessionRecord?
 
+    private enum Destination { case home, library }
+
+    enum InitialDestination {
+        case home
+        case workspaceConversation
+        case library
+    }
+
+    init(initialDestination: InitialDestination = .home) {
+        switch initialDestination {
+        case .home:
+            _destination = State(initialValue: .home)
+            _showingWorkspaceConversation = State(initialValue: false)
+        case .workspaceConversation:
+            _destination = State(initialValue: .home)
+            _showingWorkspaceConversation = State(initialValue: true)
+        case .library:
+            _destination = State(initialValue: .library)
+            _showingWorkspaceConversation = State(initialValue: false)
+        }
+    }
+
     var body: some View {
         @Bindable var runtime = runtime
 
-        HSplitView {
-            sidebar(runtime: runtime)
-                .frame(minWidth: 250, idealWidth: 300, maxWidth: 420)
+        HStack(spacing: 0) {
+            appSidebar
+                .frame(width: 196)
+                .fixedSize(horizontal: true, vertical: false)
+
+            Divider().opacity(0.4)
 
             VStack(spacing: 0) {
-                DetailHeader(runtime: runtime)
+                globalHeader
                 Divider().opacity(0.4)
-                detail
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Group {
+                    switch destination {
+                    case .home: home
+                    case .library: library
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(minWidth: 460)
         }
         .frame(minWidth: 820, minHeight: 520)
         .background(.background)
@@ -48,8 +76,23 @@ struct MainWindow: View {
             }
         }
         .animation(toastAnimation, value: runtime.toast.current)
+        .onAppear { selectFirstLibraryRecordIfNeeded() }
+        .onChange(of: destination) { _, _ in selectFirstLibraryRecordIfNeeded() }
         .onReceive(NotificationCenter.default.publisher(for: .myWhisprFocusSearch)) { _ in
+            destination = .library
             searchFocused = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .myWhisprOpenLibrary)) { _ in
+            destination = .library
+        }
+        .onChange(of: runtime.sessions.map(\.id)) { _, ids in
+            guard destination == .library else { return }
+            if let selected = runtime.selectedSessionID, ids.contains(selected) { return }
+            runtime.selectedSessionID = ids.first
+        }
+        .onChange(of: runtime.workspaceChat.isEmpty) { _, empty in
+            guard empty, !runtime.workspaceChat.isBusy else { return }
+            showingWorkspaceConversation = false
         }
         .confirmationDialog(
             "Delete “\(meetingPendingDeletion?.title ?? "this meeting")”?",
@@ -66,6 +109,16 @@ struct MainWindow: View {
             Button("Cancel", role: .cancel) { meetingPendingDeletion = nil }
         } message: {
             Text("The transcript, the summary, and both audio tracks are removed from this Mac. This cannot be undone.")
+        }
+        .confirmationDialog(
+            "Clear this conversation?",
+            isPresented: $confirmingWorkspaceClear,
+            titleVisibility: .visible
+        ) {
+            Button("Clear conversation", role: .destructive) { runtime.workspaceChat.clear() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Questions and answers will be removed. Meetings stay unchanged.")
         }
     }
 
@@ -87,45 +140,201 @@ struct MainWindow: View {
         }
     }
 
-    private func sidebar(runtime: AppRuntime) -> some View {
-        @Bindable var runtime = runtime
+    private func selectFirstLibraryRecordIfNeeded() {
+        guard destination == .library, runtime.selectedSessionID == nil else { return }
+        runtime.selectedSessionID = runtime.sessions.first?.id
+    }
 
-        return VStack(spacing: 0) {
-            // Sits in the space the transparent titlebar leaves free, so the window
-            // reads as one surface rather than chrome stacked on content.
-            VStack(spacing: 8) {
-                Picker("", selection: $runtime.filter) {
-                    Text("Dictation").tag(WorkflowKind.dictation)
-                    Text("Meetings").tag(WorkflowKind.meeting)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
+    private var appSidebar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("MyWhispr")
+                .font(.system(size: 15, weight: .semibold))
+                .padding(.horizontal, 14)
+                .padding(.bottom, 12)
 
-                SearchField(
-                    text: $runtime.searchText,
-                    prompt: runtime.filter == .dictation ? "Search dictations" : "Search meetings",
-                    focused: $searchFocused
-                )
+            destinationButton("Home", systemImage: "house", destination: .home)
+            destinationButton("Library", systemImage: "rectangle.stack", destination: .library)
+
+            Spacer()
+
+            Button {
+                runtime.openWindowHandler?(WindowID.settings)
+            } label: {
+                Label("Settings", systemImage: "gearshape")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .frame(height: 34)
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 34)
-            .padding(.bottom, 10)
-
-            Divider().opacity(0.4)
-
-            SessionList(
-                sessions: runtime.sessions,
-                kind: runtime.filter,
-                selection: $runtime.selectedSessionID,
-                searchText: runtime.searchText,
-                onDelete: { requestDelete($0) }
-            )
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
         }
+        .padding(.horizontal, 8)
+        .padding(.top, 44)
+        .padding(.bottom, 12)
         .background(.background.secondary)
     }
 
+    private func destinationButton(
+        _ title: String,
+        systemImage: String,
+        destination next: Destination
+    ) -> some View {
+        Button {
+            destination = next
+        } label: {
+            Label(title, systemImage: systemImage)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .frame(height: 34)
+                .background(
+                    destination == next ? Color.primary.opacity(0.08) : .clear,
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var globalHeader: some View {
+        HStack(spacing: 10) {
+            if destination == .home, showingWorkspaceConversation {
+                Button {
+                    withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .glassMorph) {
+                        showingWorkspaceConversation = false
+                    }
+                } label: {
+                    Label("Home", systemImage: "chevron.left")
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                if !runtime.workspaceChat.isEmpty {
+                    Menu {
+                        Button("Clear conversation", role: .destructive) {
+                            confirmingWorkspaceClear = true
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .frame(width: 20, height: 20)
+                    }
+                    .menuStyle(.button)
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+                    .help("Conversation options")
+                }
+            }
+            Spacer()
+            if runtime.isMeetingActive {
+                ActiveMeetingPill(runtime: runtime)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 30)
+        .padding(.bottom, 10)
+        .frame(minHeight: 64)
+    }
+
     @ViewBuilder
-    private var detail: some View {
+    private var home: some View {
+        ZStack {
+            if showingWorkspaceConversation {
+                workspaceConversation
+                    .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 1.015)))
+            } else {
+                HomeStartView(
+                    runtime: runtime,
+                    namespace: workspaceTransition,
+                    ask: askFromHome
+                )
+                .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.97)))
+            }
+        }
+        .animation(reduceMotion ? .easeOut(duration: 0.12) : .glassMorph, value: showingWorkspaceConversation)
+    }
+
+    private var workspaceConversation: some View {
+        MeetingChatView(chat: runtime.workspaceChat, runtime: runtime)
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                WorkspaceComposer(
+                    chat: runtime.workspaceChat,
+                    runtime: runtime,
+                    namespace: workspaceTransition,
+                    compact: true
+                )
+            }
+    }
+
+    private func askFromHome() {
+        runtime.workspaceChat.send()
+        guard runtime.workspaceChat.messages.last?.role == .user else { return }
+        withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .glassMorph) {
+            showingWorkspaceConversation = true
+        }
+    }
+
+    @ViewBuilder
+    private var library: some View {
+        @Bindable var runtime = runtime
+        if runtime.sessions.isEmpty, runtime.searchText.isEmpty {
+            VStack(spacing: 18) {
+                Picker("", selection: $runtime.filter) {
+                    Text("Meetings").tag(WorkflowKind.meeting)
+                    Text("Dictations").tag(WorkflowKind.dictation)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 280)
+                EmptyStateView(
+                    icon: runtime.filter == .dictation ? "waveform" : "person.wave.2",
+                    message: runtime.filter == .dictation ? "No dictations yet" : "No meetings yet",
+                    actionTitle: runtime.filter == .dictation ? "Home" : "Start meeting",
+                    action: {
+                        if runtime.filter == .meeting { runtime.startMeeting() }
+                        else { destination = .home }
+                    }
+                )
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            HSplitView {
+                VStack(spacing: 0) {
+                    VStack(spacing: 8) {
+                        Picker("", selection: $runtime.filter) {
+                            Text("Meetings").tag(WorkflowKind.meeting)
+                            Text("Dictations").tag(WorkflowKind.dictation)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+
+                        SearchField(
+                            text: $runtime.searchText,
+                            prompt: runtime.filter == .dictation ? "Search dictations" : "Search meetings",
+                            focused: $searchFocused
+                        )
+                    }
+                    .padding(12)
+
+                    Divider().opacity(0.4)
+
+                    SessionList(
+                        sessions: runtime.sessions,
+                        kind: runtime.filter,
+                        selection: $runtime.selectedSessionID,
+                        searchText: runtime.searchText,
+                        summaryGenerationSessionID: runtime.summaryGeneration.sessionID,
+                        onDelete: { requestDelete($0) }
+                    )
+                }
+                .frame(minWidth: 260, idealWidth: 310, maxWidth: 380)
+
+                libraryDetail
+                    .frame(minWidth: 390, maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var libraryDetail: some View {
         if let detail = runtime.selectedDetail {
             switch detail.session.kind {
             case .dictation:
@@ -135,96 +344,230 @@ struct MainWindow: View {
             }
         } else {
             EmptyStateView(
-                icon: runtime.filter == .dictation ? "text.cursor" : "waveform.badge.mic",
-                message: runtime.filter == .dictation
-                    ? "Select a dictation to read, edit, or reuse it."
-                    : "Select a meeting to read its transcript."
+                icon: runtime.filter == .dictation ? "waveform" : "person.wave.2",
+                message: runtime.searchText.isEmpty
+                    ? (runtime.filter == .dictation ? "No dictations yet" : "No meetings yet")
+                    : "No matches",
+                actionTitle: runtime.searchText.isEmpty
+                    ? (runtime.filter == .dictation ? "Home" : "Start meeting")
+                    : nil,
+                action: runtime.searchText.isEmpty ? {
+                    if runtime.filter == .meeting { runtime.startMeeting() }
+                    else { destination = .home }
+                } : nil
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }
 
-/// The window's own header, in the band the transparent titlebar frees up.
-private struct DetailHeader: View {
+private struct HomeStartView: View {
     var runtime: AppRuntime
+    var namespace: Namespace.ID
+    var ask: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Spacer(minLength: 0)
-                MeetingToggleButton(runtime: runtime)
-                Button {
-                    runtime.openWindowHandler?(WindowID.settings)
-                } label: {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 13, weight: .medium))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.glass)
-                .help("Settings")
+        VStack(spacing: 24) {
+            HStack(spacing: 16) {
+                dictationCard
+                meetingCard
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 30)
-            .padding(.bottom, 10)
+            .frame(height: 190)
 
-            if !runtime.permissions.dictationReady {
-                PermissionBanner(runtime: runtime)
-            }
-        }
-    }
-}
-
-/// One button that both starts and stops a meeting, because to the owner it is one
-/// switch, not two commands.
-struct MeetingToggleButton: View {
-    var runtime: AppRuntime
-
-    var body: some View {
-        Button {
-            runtime.toggleMeeting()
-        } label: {
-            Label(
-                runtime.isMeetingActive ? "Stop meeting" : "Start meeting",
-                systemImage: runtime.isMeetingActive ? "stop.fill" : "record.circle"
+            WorkspaceComposer(
+                chat: runtime.workspaceChat,
+                runtime: runtime,
+                namespace: namespace,
+                compact: false,
+                send: ask
             )
-            .font(.system(size: 12, weight: .medium))
         }
-        .buttonStyle(.glassProminent)
-        .tint(runtime.isMeetingActive ? Palette.danger : Palette.accent)
-        .disabled(!runtime.canStartMeeting && !runtime.isMeetingActive)
-        .help(
-            runtime.isMeetingActive
-                ? "Stop recording and start transcribing"
-                : "Record your microphone and this Mac's audio together"
-        )
+        .frame(maxWidth: 720)
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .task {
+            runtime.workspaceChat.loadWorkspace()
+            runtime.permissions.beginPolling()
+        }
+        .onDisappear { runtime.permissions.endPolling() }
     }
-}
 
-/// Shown while dictation cannot work. Names the missing capability in terms of what
-/// stops working, not in terms of the macOS permission's own vocabulary.
-struct PermissionBanner: View {
-    var runtime: AppRuntime
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Palette.accent)
-            Text(runtime.permissions.blockedSummary)
+    private var dictationCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Right ⌘")
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(.background, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.separator, lineWidth: 0.5))
+            Text("Hold and speak")
+                .font(.system(size: 16, weight: .semibold))
+            Text("Speech appears at your cursor.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
-            Spacer(minLength: 8)
-            Button("Finish setup") { runtime.openWindowHandler?(WindowID.setup) }
+            Spacer()
+            HStack(spacing: 6) {
+                Label(
+                    runtime.permissions.dictationReady ? "Ready" : "Needs setup",
+                    systemImage: runtime.permissions.dictationReady ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
+                )
+                .foregroundStyle(runtime.permissions.dictationReady ? Palette.affirm : Palette.accent)
+                Spacer()
+                if !runtime.permissions.dictationReady {
+                    Button("Set up dictation") { runtime.openWindowHandler?(WindowID.setup) }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.system(size: 11, weight: .medium))
+        }
+        .homeCard()
+    }
+
+    @ViewBuilder
+    private var meetingCard: some View {
+        if runtime.isMeetingActive {
+            meetingCardContent
+                .homeCard()
+        } else {
+            Button { runtime.startMeeting() } label: {
+                meetingCardContent
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .homeCard()
+            .disabled(!runtime.canStartMeeting)
+        }
+    }
+
+    private var meetingCardContent: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Image(systemName: runtime.isMeetingActive ? "record.circle.fill" : "record.circle")
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(runtime.isMeetingActive ? Palette.danger : .secondary)
+            Text(runtime.isMeetingActive ? "Recording" : "Start meeting")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.primary)
+            Spacer()
+            Label("Microphone", systemImage: runtime.permissions.microphone == .granted ? "checkmark.circle.fill" : "exclamationmark.circle")
+            Label("Mac audio when available", systemImage: "desktopcomputer")
+            HStack(spacing: 12) {
+                Text("In person or online")
+                Text("Records without internet")
+            }
+            Text("Also in the menu bar")
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    }
+}
+
+private extension View {
+    func homeCard() -> some View {
+        self
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .padding(20)
+            .background(.background.secondary, in: RoundedRectangle(cornerRadius: Metrics.card, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Metrics.card).strokeBorder(.separator.opacity(0.65), lineWidth: 0.5))
+    }
+}
+
+private struct WorkspaceComposer: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Bindable var chat: ConversationController
+    var runtime: AppRuntime
+    var namespace: Namespace.ID
+    var compact: Bool
+    var send: (() -> Void)?
+
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("All meetings")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !runtime.canAskLocalAI {
+                    Text("AI is unavailable.")
+                        .foregroundStyle(.secondary)
+                    Button("Open AI settings") {
+                        runtime.openWindowHandler?(WindowID.settings)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(Palette.accent)
+                }
+            }
+            .font(.system(size: 11))
+            HStack(spacing: 10) {
+                TextField(compact ? "Ask a follow-up" : "Ask anything about your meetings", text: $chat.draft, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1...5)
+                    .focused($focused)
+                    .onSubmit { (send ?? chat.send)() }
+
+                Button {
+                    if chat.isBusy { chat.stop() }
+                    else { (send ?? chat.send)() }
+                } label: {
+                    Label(chat.isBusy ? "Stop" : "Ask", systemImage: chat.isBusy ? "stop.fill" : "arrow.up")
+                        .frame(minWidth: 56)
+                }
                 .buttonStyle(.glassProminent)
                 .tint(Palette.accent)
-                .controlSize(.small)
+                .disabled(!chat.isBusy && (!chat.canSend || !runtime.canAskLocalAI))
+                .keyboardShortcut(.return, modifiers: [.command])
+            }
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .glassEffect(.regular.tint(Palette.accent.opacity(0.12)), in: .rect(cornerRadius: Metrics.card, style: .continuous))
-        .padding(.horizontal, 14)
-        .padding(.bottom, 8)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .frame(maxWidth: 720)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: Metrics.card, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: Metrics.card).strokeBorder(.separator.opacity(0.7), lineWidth: 0.5))
+        .modifier(WorkspaceComposerGeometry(namespace: namespace, enabled: !reduceMotion))
+        .padding(compact ? 16 : 0)
+    }
+}
+
+private struct WorkspaceComposerGeometry: ViewModifier {
+    var namespace: Namespace.ID
+    var enabled: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if enabled {
+            content.matchedGeometryEffect(id: "workspace-composer", in: namespace)
+        } else {
+            content
+        }
+    }
+}
+
+/// A connected live object: status, elapsed time, and the only Stop action stay in
+/// one place no matter which screen is open.
+private struct ActiveMeetingPill: View {
+    var runtime: AppRuntime
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Palette.danger)
+                .frame(width: 7, height: 7)
+            Text(Clock.string(runtime.meetingElapsed))
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .monospacedDigit()
+            Divider().frame(height: 14)
+            Button("Stop") { runtime.stopMeeting() }
+                .buttonStyle(.plain)
+                .foregroundStyle(Palette.danger)
+        }
+        .font(.system(size: 12, weight: .medium))
+        .padding(.horizontal, 11)
+        .frame(height: 30)
+        .glassEffect(.regular, in: .capsule)
+        .help("Stop recording and start transcribing")
     }
 }
 

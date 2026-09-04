@@ -370,4 +370,25 @@ struct MeetingRecorderLifecycleTests {
     @Test func stoppingWithoutStartingReportsNothing() {
         #expect(MeetingRecorder().stop() == nil)
     }
+
+    @Test func recordingsBelowTenSecondsAreDiscardedAtTheExactBoundary() {
+        #expect(MeetingRecordingPolicy.shouldDiscard(microphoneDuration: 0))
+        #expect(MeetingRecordingPolicy.shouldDiscard(microphoneDuration: 9.999))
+        #expect(!MeetingRecordingPolicy.shouldDiscard(microphoneDuration: 10))
+        #expect(!MeetingRecordingPolicy.shouldDiscard(microphoneDuration: 10.001))
+    }
+
+    @Test func cancelledProcessingRejectsLateProgressAndCompletion() {
+        var gate = ProcessingGeneration()
+        let discarded = gate.begin()
+        #expect(gate.isCurrent(discarded))
+
+        gate.invalidate()
+        #expect(!gate.isCurrent(discarded))
+
+        let replacement = gate.begin()
+        #expect(replacement != discarded)
+        #expect(gate.isCurrent(replacement))
+        #expect(!gate.isCurrent(discarded))
+    }
 }

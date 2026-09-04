@@ -1,5 +1,40 @@
 import SwiftUI
 
+enum MeetingDetailMode: String, CaseIterable, Identifiable {
+    case transcript
+    case notes
+    case ask
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .transcript: "Transcript"
+        case .notes: "Notes"
+        case .ask: "Ask"
+        }
+    }
+}
+
+/// Keeps the selected surface stable while SwiftUI refreshes the same meeting.
+/// A genuinely different meeting still starts on its transcript.
+struct MeetingDetailSelection: Equatable {
+    private(set) var sessionID: UUID?
+    private(set) var mode: MeetingDetailMode = .transcript
+
+    @discardableResult
+    mutating func load(sessionID: UUID) -> Bool {
+        guard self.sessionID != sessionID else { return false }
+        self.sessionID = sessionID
+        mode = .transcript
+        return true
+    }
+
+    mutating func select(_ mode: MeetingDetailMode) {
+        self.mode = mode
+    }
+}
+
 /// A recorded meeting: transport, transcript, and optional local summary.
 ///
 /// Processing states get real estate rather than a spinner in a corner, because the
@@ -15,53 +50,49 @@ struct MeetingDetail: View {
     @State private var summaryDraft = ""
     @State private var editingSummary = false
     @State private var confirmingDelete = false
-    @State private var mode: Mode = .transcript
-
-    /// The two things an owner does with a finished meeting: read it, or ask about
-    /// it. They are alternatives rather than neighbours — each wants the whole
-    /// surface and its own scroll position — so they are a switch, not two panes.
-    private enum Mode: String, CaseIterable, Identifiable {
-        case transcript
-        case ask
-
-        var id: String { rawValue }
-        var title: String {
-            switch self {
-            case .transcript: "Transcript"
-            case .ask: "Ask"
-            }
-        }
-    }
+    @State private var selection = MeetingDetailSelection()
 
     /// Asking is only offered once there is something to ask about.
     private var canAsk: Bool {
         detail.session.state == .completed && !detail.segments.isEmpty
     }
 
+    private var mode: MeetingDetailMode { selection.mode }
+
+    private var modeBinding: Binding<MeetingDetailMode> {
+        Binding(
+            get: { selection.mode },
+            set: { selection.select($0) }
+        )
+    }
+
     var body: some View {
-        Group {
-            if mode == .ask, canAsk {
-                MeetingChatView(chat: runtime.chat, runtime: runtime)
-            } else {
+        ZStack {
+            switch mode {
+            case .ask where canAsk:
+                MeetingChatView(chat: runtime.meetingChat, runtime: runtime)
+            case .notes where canAsk:
+                notesSurface
+            default:
                 transcriptSurface
             }
         }
         .safeAreaInset(edge: .top, spacing: 0) { titleBar }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if mode == .ask, canAsk {
-                MeetingChatComposer(chat: runtime.chat, runtime: runtime)
+                MeetingChatComposer(chat: runtime.meetingChat, runtime: runtime)
             } else {
                 actionBar
             }
         }
-        .task(id: detail.session.id) {
+        .onChange(of: detail.session.id, initial: true) { _, sessionID in
+            guard selection.load(sessionID: sessionID) else { return }
             titleDraft = detail.session.title
             summaryDraft = detail.session.summary ?? ""
             editingSummary = false
-            mode = .transcript
         }
         .onChange(of: canAsk) { _, possible in
-            if !possible { mode = .transcript }
+            if !possible { selection.select(.transcript) }
         }
         .onChange(of: detail.session.title) { _, title in
             titleDraft = title
@@ -114,11 +145,6 @@ struct MeetingDetail: View {
                         PlaybackBar(playback: runtime.playback)
                     }
 
-                    if detail.session.summary != nil
-                        || runtime.summaryGeneration.isGenerating(for: detail.session.id) {
-                        summarySection
-                    }
-
                     if !detail.segments.isEmpty {
                         TranscriptView(
                             segments: detail.segments,
@@ -144,6 +170,36 @@ struct MeetingDetail: View {
                     proxy.scrollTo(active.id, anchor: .center)
                 }
             }
+            .task(id: runtime.meetingSourceTarget?.id) {
+                guard let target = runtime.meetingSourceTarget,
+                      target.sessionID == detail.session.id,
+                      let segment = detail.segments.last(where: { $0.start <= target.time }) else { return }
+                proxy.scrollTo(segment.id, anchor: .center)
+            }
+        }
+        .scrollEdgeEffectStyle(.soft, for: .top)
+    }
+
+    private var notesSurface: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if detail.session.summary != nil
+                    || runtime.summaryGeneration.isGenerating(for: detail.session.id) {
+                    summarySection
+                } else {
+                    EmptyStateView(
+                        icon: "note.text",
+                        message: "No notes yet",
+                        actionTitle: runtime.canAskLocalAI ? "Write notes" : "Open AI settings",
+                        action: {
+                            if runtime.canAskLocalAI { runtime.generateSummary(for: detail.session.id) }
+                            else { runtime.openWindowHandler?(WindowID.settings) }
+                        }
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 280)
+                }
+            }
+            .padding(20)
         }
         .scrollEdgeEffectStyle(.soft, for: .top)
     }
@@ -158,8 +214,8 @@ struct MeetingDetail: View {
                 .onSubmit { runtime.renameSession(id: detail.session.id, title: titleDraft) }
             Spacer(minLength: 8)
             if canAsk {
-                Picker("", selection: $mode) {
-                    ForEach(Mode.allCases) { Text($0.title).tag($0) }
+                Picker("", selection: modeBinding) {
+                    ForEach(MeetingDetailMode.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
@@ -179,7 +235,7 @@ struct MeetingDetail: View {
 
     private var actionBar: some View {
         HStack(spacing: 8) {
-            if detail.session.state == .completed {
+            if detail.session.state == .completed, mode == .notes {
                 if runtime.summaryGeneration.isGenerating(for: detail.session.id) {
                     Button {
                         runtime.cancelSummary(for: detail.session.id)
@@ -223,6 +279,9 @@ struct MeetingDetail: View {
                     )
                 }
 
+            }
+
+            if detail.session.state == .completed, mode == .transcript {
                 ConfirmingButton(
                     title: "Copy transcript",
                     systemImage: "doc.on.doc",
@@ -255,7 +314,8 @@ struct MeetingDetail: View {
         }
         .font(.system(size: 12))
         .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        .padding(.top, 10)
+        .padding(.bottom, 14)
         .background(.bar)
     }
 
@@ -334,7 +394,7 @@ struct MeetingDetail: View {
     // MARK: - Summary
 
     private var summarySection: some View {
-        Card(title: "Summary") {
+        Card(title: "Notes") {
             if runtime.summaryGeneration.isGenerating(for: detail.session.id) {
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)

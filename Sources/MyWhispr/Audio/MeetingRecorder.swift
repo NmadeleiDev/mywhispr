@@ -9,14 +9,24 @@ final class MeetingRecorder {
     /// The meeting's microphone level, for the recording indicator.
     var levels: AudioLevelRelay { microphone.levels }
 
-    func start(directoryURL: URL) throws {
+    func start(directoryURL: URL) throws -> MeetingCaptureMode {
         let microphoneURL = directoryURL.appending(path: "microphone.caf")
         let systemURL = directoryURL.appending(path: "system.caf")
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let mode: MeetingCaptureMode
         do {
             try systemAudio.start(outputURL: systemURL)
+            mode = .microphoneAndSystem
+        } catch {
+            // Mac audio is an enhancement for calls, not a prerequisite for a room
+            // conversation. The caller surfaces this mode so the missing source is
+            // never mistaken for a complete dual-track capture.
+            mode = .microphoneOnly(reason: error.localizedDescription)
+        }
+        do {
             try microphone.start(outputURL: microphoneURL)
             self.directoryURL = directoryURL
+            return mode
         } catch {
             _ = systemAudio.stop()
             microphone.cancel()
@@ -33,17 +43,15 @@ final class MeetingRecorder {
         let microphoneCapture = microphone.stop()
         let systemCapture = systemAudio.stop()
         self.directoryURL = nil
-        // One track is enough. A meeting where nothing played on this Mac, or where
-        // the input device was pulled part-way through, still has a recording worth
-        // transcribing; demanding both is what turns a partial meeting into a lost
-        // one. A track that produced nothing is named anyway and skipped downstream,
-        // where "this file holds no speech" is already an ordinary outcome.
-        guard microphoneCapture != nil || systemCapture != nil else { return nil }
+        // The microphone is the required meeting record. System audio is optional
+        // and remains optional in the value handed to every downstream consumer.
+        guard let microphoneCapture else { return nil }
         return MeetingAudioFiles(
             directoryURL: directoryURL,
-            microphoneURL: microphoneCapture?.url ?? directoryURL.appending(path: "microphone.caf"),
-            systemURL: systemCapture?.url ?? directoryURL.appending(path: "system.caf"),
-            duration: max(microphoneCapture?.duration ?? 0, systemCapture?.duration ?? 0)
+            microphoneURL: microphoneCapture.url,
+            systemURL: systemCapture?.url,
+            microphoneDuration: microphoneCapture.duration,
+            duration: max(microphoneCapture.duration, systemCapture?.duration ?? 0)
         )
     }
 }
@@ -51,6 +59,25 @@ final class MeetingRecorder {
 struct MeetingAudioFiles: Sendable {
     let directoryURL: URL
     let microphoneURL: URL
-    let systemURL: URL
+    let systemURL: URL?
+    /// The microphone is the required source and therefore the clock used for the
+    /// minimum useful recording rule. Optional system capture can start slightly
+    /// earlier and must not turn a nine-second meeting into a retained one.
+    let microphoneDuration: TimeInterval
     let duration: TimeInterval
+}
+
+enum MeetingRecordingPolicy {
+    static let minimumDuration: TimeInterval = 10
+
+    /// A recording at the exact boundary is useful; only recordings below it are
+    /// accidental starts that should disappear without entering transcription.
+    static func shouldDiscard(microphoneDuration: TimeInterval) -> Bool {
+        microphoneDuration < minimumDuration
+    }
+}
+
+enum MeetingCaptureMode: Equatable, Sendable {
+    case microphoneAndSystem
+    case microphoneOnly(reason: String)
 }

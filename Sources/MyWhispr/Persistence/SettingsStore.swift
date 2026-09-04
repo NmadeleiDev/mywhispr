@@ -31,9 +31,12 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
     /// is the common case; a separate field lets a small fast model clean up
     /// dictation while a larger one writes meeting notes.
     var summaryModel = ""
+    /// Model used only to embed meeting passages for semantic retrieval. Keeping
+    /// it separate prevents an embedding-only model from ever being sent a chat.
+    var embeddingModel = ""
     var rewriteEnabled = false
     var rewritePrompt = LocalAIConfiguration.defaultRewritePrompt
-    var summaryPrompt = "Create concise meeting notes with decisions and action items. Do not invent facts. Return Markdown."
+    var summaryPrompt = LocalAIConfiguration.defaultSummaryPrompt
     /// Language used for both the generated meeting title and its notes. Matching
     /// the transcript is the least surprising default for multilingual owners.
     var summaryLanguage = SummaryLanguage.transcript
@@ -69,6 +72,7 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
         baseURL = value(.baseURL, fallback.baseURL)
         model = value(.model, fallback.model)
         summaryModel = value(.summaryModel, fallback.summaryModel)
+        embeddingModel = value(.embeddingModel, fallback.embeddingModel)
         rewriteEnabled = value(.rewriteEnabled, fallback.rewriteEnabled)
         rewritePrompt = value(.rewritePrompt, fallback.rewritePrompt)
         summaryPrompt = value(.summaryPrompt, fallback.summaryPrompt)
@@ -102,6 +106,11 @@ struct LocalAIConfiguration: Codable, Equatable, Sendable {
     Cite the timestamp in square brackets when you point at something specific, and \
     quote the speaker's own words when the wording matters. Be brief unless asked \
     for detail. Answer in the language of the question. Format with Markdown.
+    """
+
+    static let defaultSummaryPrompt = """
+    Create concise meeting notes with decisions and action items. Do not invent \
+    facts. Return Markdown.
     """
 
     /// Polish, not rewriting.

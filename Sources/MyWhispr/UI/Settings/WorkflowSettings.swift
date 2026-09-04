@@ -298,21 +298,6 @@ struct MeetingSettings: View {
                         .foregroundStyle(.secondary)
                 }
             }
-
-            Card(
-                title: "Summaries",
-                footnote: "Summaries are generated on demand, never automatically, and only by the local AI model you choose."
-            ) {
-                Text("Sent with the transcript to your local model.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-                TextEditor(text: $settings.payload.localAI.summaryPrompt)
-                    .font(.system(size: 12))
-                    .scrollContentBackground(.hidden)
-                    .frame(height: 80)
-                    .padding(8)
-                    .background(.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
         }
     }
 }

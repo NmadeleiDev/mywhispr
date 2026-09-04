@@ -9,7 +9,8 @@
 
 MyWhispr turns speech into text entirely on your Mac. Hold a key to dictate into
 any application, record and transcribe meetings with speaker separation, search
-and edit your history, or transcribe existing audio files from the command line.
+and edit your history, ask a local AI across all recorded meetings, or transcribe
+existing audio files from the command line.
 There is no account, cloud transcription, subscription, telemetry, or usage
 limit.
 
@@ -104,6 +105,10 @@ question view.
 
 - Start or stop a meeting from the app, menu bar, or a configurable global
   shortcut.
+- Record an in-person meeting from the microphone even when Mac system audio is
+  unavailable; capture continues without an internet connection.
+- Discard accidental meeting recordings shorter than 10 seconds before
+  transcription, without leaving audio or a Library entry behind.
 - Record microphone input and Mac system output as separate local CAF tracks
   without changing the selected output device.
 - Display recording duration and live input level while capture is active.
@@ -135,6 +140,13 @@ question view.
 - Ask follow-up questions against an entire meeting transcript, including speaker
   names and timestamps. Answers stream into a persistent per-meeting conversation
   and can be stopped without discarding the text already received.
+- Ask across every completed meeting from Home. MyWhispr retrieves bounded,
+  speaker- and timestamp-aware evidence with hybrid SQLite and optional local
+  semantic search, excludes dictations by construction, applies relative-date ranges
+  before retrieval, and persists one expandable source card per cited meeting with
+  Summary, Transcript, Open, and Play actions. Passage-level citations are validated
+  before they are stored. The design and measured upgrade path are documented in
+  [Meeting corpus architecture](docs/meeting-corpus.md).
 - Retry interrupted questions and clear a conversation without touching the
   transcript, summary, or recording.
 - Estimate the context required by the full transcript, request an appropriate

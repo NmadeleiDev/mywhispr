@@ -6,16 +6,18 @@ import SwiftUI
 /// followed by "who disagreed", and that second question only means anything if the
 /// first one is still on screen.
 struct MeetingChatView: View {
-    var chat: MeetingChatController
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var chat: ConversationController
     var runtime: AppRuntime
 
     private static let bottomAnchor = "chat-bottom"
+    @State private var isNearBottom = true
 
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
-                    if chat.isEmpty && chat.errorMessage == nil {
+                    if chat.isEmpty && chat.errorMessage == nil && chat.scope != .allMeetings {
                         opening
                     }
 
@@ -44,16 +46,47 @@ struct MeetingChatView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .scrollEdgeEffectStyle(.soft, for: .top)
-            .onChange(of: chat.messages.count) { _, _ in scrollToEnd(proxy, animated: true) }
-            .onChange(of: chat.isReading) { _, _ in scrollToEnd(proxy, animated: true) }
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                let remaining = geometry.contentSize.height
+                    - geometry.contentOffset.y
+                    - geometry.containerSize.height
+                return remaining < 80
+            } action: { _, nearBottom in
+                isNearBottom = nearBottom
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if !isNearBottom {
+                    Button {
+                        scrollToEnd(proxy, animated: true)
+                    } label: {
+                        Label("Latest", systemImage: "arrow.down")
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+                    .padding(12)
+                }
+            }
+            .onChange(of: chat.messages.count) { _, _ in
+                // A newly sent question is the owner's explicit move to the live
+                // edge. Persisting the final assistant turn is not: if they scrolled
+                // up while it streamed, keep their reading position.
+                if chat.messages.last?.role == .user || isNearBottom {
+                    scrollToEnd(proxy, animated: true)
+                }
+            }
+            .onChange(of: chat.isReading) { _, reading in
+                if reading && isNearBottom { scrollToEnd(proxy, animated: true) }
+            }
             // Not animated: an answer being written moves the anchor several times a
             // second, and animating each move fights the one before it.
-            .onChange(of: chat.streamingAnswer) { _, _ in scrollToEnd(proxy, animated: false) }
+            .onChange(of: chat.streamingAnswer) { _, _ in
+                if isNearBottom { scrollToEnd(proxy, animated: false) }
+            }
         }
     }
 
     private func scrollToEnd(_ proxy: ScrollViewProxy, animated: Bool) {
-        guard animated else {
+        guard animated, !reduceMotion else {
             proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
             return
         }
@@ -70,7 +103,11 @@ struct MeetingChatView: View {
         case .user:
             question(message.content)
         case .assistant, .system:
-            answerBubble(message.content, isWriting: false)
+            answerBubble(
+                message.content,
+                isWriting: false,
+                sources: chat.sources(for: message.id)
+            )
         }
     }
 
@@ -92,7 +129,11 @@ struct MeetingChatView: View {
         }
     }
 
-    private func answerBubble(_ text: String, isWriting: Bool) -> some View {
+    private func answerBubble(
+        _ text: String,
+        isWriting: Bool,
+        sources: [ChatSourceRecord] = []
+    ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             // The same renderer the summary uses: a model asked for Markdown writes
             // Markdown, and raw asterisks in an answer are as unreadable here as there.
@@ -102,6 +143,14 @@ struct MeetingChatView: View {
             if isWriting {
                 WritingIndicator()
             } else {
+                if !sources.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(sources) { source in
+                            ChatSourceRow(source: source, runtime: runtime)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
                 ConfirmingButton(
                     title: "Copy",
                     systemImage: "doc.on.doc",
@@ -119,9 +168,9 @@ struct MeetingChatView: View {
     /// owner picks from instead of asking what they actually want to know.
     private var opening: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Ask about this meeting")
+            Text(chat.scope == .allMeetings ? "Ask your meetings" : "Ask about this meeting")
                 .font(.system(size: 14, weight: .semibold))
-            Text("\(runtime.summaryModelName) reads the whole transcript on this Mac and answers from it. Nothing is sent anywhere else.")
+            Text(openingDetail)
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -144,10 +193,14 @@ struct MeetingChatView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    private var openingDetail: String {
+        return "\(runtime.summaryModelName) reads the transcript and answers from it."
+    }
+
     private var reading: some View {
         HStack(spacing: 10) {
             ProgressView().controlSize(.small)
-            Text("Reading the meeting…")
+            Text(chat.scope == .allMeetings ? "Reading meetings…" : "Reading the meeting…")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
         }
@@ -191,16 +244,139 @@ struct MeetingChatView: View {
     }
 }
 
+/// One cited meeting. Passage retrieval stays inside the card, where it belongs.
+struct ChatSourceRow: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var source: ChatSourceRecord
+    var runtime: AppRuntime
+
+    @State private var expanded = false
+    @State private var content: Content
+
+    enum Content: Hashable {
+        case summary
+        case transcript
+    }
+
+    init(source: ChatSourceRecord, runtime: AppRuntime, initiallyExpanded: Bool = false) {
+        self.source = source
+        self.runtime = runtime
+        _expanded = State(initialValue: initiallyExpanded)
+        _content = State(initialValue: source.summaryText == nil ? .transcript : .summary)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                if reduceMotion {
+                    expanded.toggle()
+                } else {
+                    withAnimation(.smooth(duration: 0.2)) { expanded.toggle() }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                        .accessibilityHidden(true)
+                    Text(source.sourceLabel)
+                        .font(.system(size: 11, weight: .medium))
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(source.sourceLabel)
+            .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(expanded ? "Collapses meeting source" : "Shows meeting source")
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 12) {
+                    if source.summaryText != nil {
+                        Picker("Source content", selection: $content) {
+                            Text("Summary").tag(Content.summary)
+                            Text("Transcript").tag(Content.transcript)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(maxWidth: 220)
+                    }
+
+                    switch content {
+                    case .summary:
+                        if let summary = source.summaryText {
+                            MarkdownText(markdown: summary)
+                                .textSelection(.enabled)
+                        }
+                    case .transcript:
+                        VStack(alignment: .leading, spacing: 12) {
+                            ForEach(source.passages) { passage in
+                                VStack(alignment: .leading, spacing: 7) {
+                                    Text(passage.text)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                        .fixedSize(horizontal: false, vertical: true)
+
+                                    if source.sessionID != nil {
+                                        Button("Play from \(Clock.string(passage.start))") {
+                                            runtime.openMeetingSource(source, at: passage.start, play: true)
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .foregroundStyle(.primary)
+                                        .controlSize(.small)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if source.sessionID != nil {
+                        Divider().opacity(0.5)
+                        HStack {
+                            Button {
+                                runtime.openMeetingSource(source, play: false)
+                            } label: {
+                                Label("Open meeting", systemImage: "arrow.up.forward.app")
+                            }
+                            .buttonStyle(.bordered)
+                            .foregroundStyle(.primary)
+                            .controlSize(.small)
+                            Spacer(minLength: 0)
+                        }
+                    } else {
+                        Label("Meeting deleted", systemImage: "exclamationmark.circle")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 4)
+                .padding(.bottom, 12)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .background(.background.secondary, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.separator.opacity(0.6), lineWidth: 0.5))
+    }
+}
+
 /// The caret that says an answer is still being written.
 private struct WritingIndicator: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var on = false
 
     var body: some View {
         Rectangle()
             .fill(Palette.accent)
             .frame(width: 7, height: 13)
-            .opacity(on ? 1 : 0.15)
+            .opacity(reduceMotion ? 1 : (on ? 1 : 0.15))
             .task {
+                guard !reduceMotion else { return }
                 // A repeating animation rather than a spinner: the answer is already
                 // arriving, and a spinner would say it had not started.
                 withAnimation(.easeInOut(duration: 0.55).repeatForever(autoreverses: true)) {
@@ -212,7 +388,7 @@ private struct WritingIndicator: View {
 
 /// The composer, pinned below the conversation.
 struct MeetingChatComposer: View {
-    @Bindable var chat: MeetingChatController
+    @Bindable var chat: ConversationController
     var runtime: AppRuntime
 
     @FocusState private var focused: Bool
@@ -222,11 +398,13 @@ struct MeetingChatComposer: View {
         VStack(spacing: 8) {
             if !runtime.canAskLocalAI {
                 notice(
-                    "Connect a local AI service in Settings to ask questions about a meeting.",
+                    "Connect a local AI service in Settings to ask questions about your meetings.",
                     tone: .secondary
                 )
             } else if let warning = chat.contextWarning {
                 notice(warning, tone: .warning)
+            } else if let searchNotice = chat.searchNotice {
+                notice(searchNotice, tone: .secondary)
             }
 
             HStack(spacing: 8) {
@@ -243,7 +421,7 @@ struct MeetingChatComposer: View {
                     .help("Clear this conversation")
                 }
 
-                TextField("Ask about this meeting", text: $chat.draft, axis: .vertical)
+                TextField(chat.scope == .allMeetings ? "Ask anything about your meetings" : "Ask about this meeting", text: $chat.draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.system(size: 13))
                     .lineLimit(1...5)
