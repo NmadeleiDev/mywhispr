@@ -8,6 +8,7 @@ import OSLog
 /// interpreting global model activity as its own progress.
 struct SummaryGenerationState: Equatable, Sendable {
     private(set) var sessionID: UUID?
+    private var automaticQueue: [UUID] = []
 
     var isActive: Bool { sessionID != nil }
 
@@ -21,9 +22,49 @@ struct SummaryGenerationState: Equatable, Sendable {
         return true
     }
 
-    mutating func finish(for sessionID: UUID) {
-        guard self.sessionID == sessionID else { return }
-        self.sessionID = nil
+    /// Starts an automatic summary now, or remembers it behind the summary that is
+    /// already using the model. A meeting must not lose its promised notes merely
+    /// because the owner happened to request another summary while it recorded.
+    mutating func startAutomatically(for sessionID: UUID) -> Bool {
+        guard self.sessionID != sessionID, !automaticQueue.contains(sessionID) else { return false }
+        guard self.sessionID == nil else {
+            automaticQueue.append(sessionID)
+            return false
+        }
+        self.sessionID = sessionID
+        return true
+    }
+
+    /// Releases the current model job and transfers ownership to the oldest
+    /// automatically queued meeting, if there is one.
+    @discardableResult
+    mutating func finish(for sessionID: UUID) -> UUID? {
+        guard self.sessionID == sessionID else { return nil }
+        guard !automaticQueue.isEmpty else {
+            self.sessionID = nil
+            return nil
+        }
+        let next = automaticQueue.removeFirst()
+        self.sessionID = next
+        return next
+    }
+
+    mutating func discardAutomaticQueue() {
+        automaticQueue.removeAll()
+    }
+}
+
+enum AutomaticMeetingSummaryPolicy {
+    static func shouldGenerate(
+        enabled: Bool,
+        configuration: LocalAIConfiguration,
+        existingSummary: String?
+    ) -> Bool {
+        let model = configuration.effectiveSummaryModel
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let summary = existingSummary?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return enabled && !model.isEmpty && summary.isEmpty
     }
 }
 
@@ -341,6 +382,9 @@ final class AppRuntime {
             meetingSemanticIndexTask?.cancel()
             meetingSemanticIndexTask = nil
             prepareSemanticMeetingSearch()
+        }
+        if !payload.automaticallySummarizeMeetings || !canAskLocalAI {
+            summaryGeneration.discardAutomaticQueue()
         }
     }
 
@@ -1019,6 +1063,7 @@ final class AppRuntime {
             reloadSessions()
             refreshStorageSizes()
             if selectedSessionID == record.id { loadSelectedDetail() }
+            generateSummaryAutomaticallyIfNeeded(for: record)
         } catch is CancellationError {
             // `cancelProcessing` owns deletion and the visible state change.
         } catch {
@@ -1456,23 +1501,60 @@ final class AppRuntime {
     }
 
     func generateSummary(for sessionID: UUID) {
-        guard summaryGeneration.start(for: sessionID),
-              let detail = try? database.sessionDetail(id: sessionID),
+        guard summaryGeneration.start(for: sessionID) else { return }
+        guard let detail = try? database.sessionDetail(id: sessionID),
               !detail.transcript.isEmpty else {
-            summaryGeneration.finish(for: sessionID)
+            advanceSummaryQueue(after: sessionID)
             return
         }
         let configuration = settings.payload.localAI
+        performSummary(for: sessionID, detail: detail, configuration: configuration)
+    }
+
+    private func generateSummaryAutomaticallyIfNeeded(for session: SessionRecord) {
+        let configuration = settings.payload.localAI
+        guard AutomaticMeetingSummaryPolicy.shouldGenerate(
+            enabled: settings.payload.automaticallySummarizeMeetings,
+            configuration: configuration,
+            existingSummary: session.summary
+        ) else { return }
+
+        guard summaryGeneration.startAutomatically(for: session.id) else { return }
+        startOwnedAutomaticSummary(for: session.id, configuration: configuration)
+    }
+
+    private func startOwnedAutomaticSummary(
+        for sessionID: UUID,
+        configuration: LocalAIConfiguration
+    ) {
+        guard let detail = try? database.sessionDetail(id: sessionID),
+              !detail.transcript.isEmpty,
+              AutomaticMeetingSummaryPolicy.shouldGenerate(
+                enabled: settings.payload.automaticallySummarizeMeetings,
+                configuration: configuration,
+                existingSummary: detail.session.summary
+              ) else {
+            advanceSummaryQueue(after: sessionID)
+            return
+        }
+        performSummary(for: sessionID, detail: detail, configuration: configuration)
+    }
+
+    private func performSummary(
+        for sessionID: UUID,
+        detail: SessionDetail,
+        configuration: LocalAIConfiguration
+    ) {
         summaryTask = Task { [weak self] in
             guard let self else { return }
             do {
                 let summary = try await localAI.summarize(detail.annotatedTranscript, configuration: configuration)
                 guard !Task.isCancelled else { return }
                 self.updateGeneratedSummary(summary, for: sessionID)
-                self.finishSummaryGeneration(for: sessionID)
+                self.advanceSummaryQueue(after: sessionID)
             } catch {
                 guard !Task.isCancelled else { return }
-                self.finishSummaryGeneration(for: sessionID)
+                self.advanceSummaryQueue(after: sessionID)
                 self.toast.present("Summary failed: \(error.localizedDescription)", tone: .failure)
             }
         }
@@ -1482,12 +1564,13 @@ final class AppRuntime {
         guard summaryGeneration.isGenerating(for: sessionID) else { return }
         summaryTask?.cancel()
         summaryTask = nil
-        summaryGeneration.finish(for: sessionID)
+        advanceSummaryQueue(after: sessionID)
     }
 
-    private func finishSummaryGeneration(for sessionID: UUID) {
+    private func advanceSummaryQueue(after sessionID: UUID) {
         summaryTask = nil
-        summaryGeneration.finish(for: sessionID)
+        guard let next = summaryGeneration.finish(for: sessionID) else { return }
+        startOwnedAutomaticSummary(for: next, configuration: settings.payload.localAI)
     }
 
     func updateSummary(_ summary: String, for sessionID: UUID) {

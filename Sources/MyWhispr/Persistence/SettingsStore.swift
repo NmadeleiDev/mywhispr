@@ -270,6 +270,10 @@ final class SettingsStore {
 
         var historyRetention: HistoryRetention = .thirtyDays
         var meetingAudioRetention: MeetingAudioRetention = .keep
+        /// Writes notes as soon as a meeting transcript is ready. This remains a
+        /// workflow preference rather than part of the connection: changing local
+        /// AI providers must not silently change what happens after a meeting.
+        var automaticallySummarizeMeetings = false
 
         var launchAtLogin = false
         var playCues = true
@@ -323,6 +327,10 @@ final class SettingsStore {
             tidyDictation = value(.tidyDictation, fallback.tidyDictation)
             historyRetention = value(.historyRetention, fallback.historyRetention)
             meetingAudioRetention = value(.meetingAudioRetention, fallback.meetingAudioRetention)
+            automaticallySummarizeMeetings = value(
+                .automaticallySummarizeMeetings,
+                fallback.automaticallySummarizeMeetings
+            )
             launchAtLogin = value(.launchAtLogin, fallback.launchAtLogin)
             playCues = value(.playCues, fallback.playCues)
             showHUD = value(.showHUD, fallback.showHUD)

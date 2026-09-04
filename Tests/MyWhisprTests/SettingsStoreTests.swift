@@ -38,6 +38,21 @@ struct SettingsStoreTests {
         #expect(legacy.payload.localAI.summaryLanguage == .transcript)
     }
 
+    @Test("Automatic meeting summaries are opt-in and survive relaunch")
+    func persistsAutomaticMeetingSummariesCompatibly() throws {
+        let suite = "MyWhisprTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = SettingsStore(defaults: defaults)
+        #expect(!store.payload.automaticallySummarizeMeetings)
+        store.payload.automaticallySummarizeMeetings = true
+        #expect(SettingsStore(defaults: defaults).payload.automaticallySummarizeMeetings)
+
+        defaults.set(Data(#"{"localAI":{"summaryModel":"local-model"}}"#.utf8), forKey: "settings.payload.v2")
+        #expect(!SettingsStore(defaults: defaults).payload.automaticallySummarizeMeetings)
+    }
+
     @Test("Embedding model survives relaunch and old settings keep exact search")
     func persistsEmbeddingModelCompatibly() throws {
         let suite = "MyWhisprTests.\(UUID().uuidString)"

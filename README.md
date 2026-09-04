@@ -137,6 +137,9 @@ question view.
 - Generate meeting summaries on demand in the transcript's language or a chosen
   language. The same request creates a scannable recording title for the sidebar;
   render the Markdown notes and let them be edited, copied, stopped, or regenerated.
+- Optionally generate those notes and the descriptive title automatically as soon
+  as a meeting finishes transcribing, serializing meetings when the local model is
+  already writing another summary.
 - Ask follow-up questions against an entire meeting transcript, including speaker
   names and timestamps. Answers stream into a persistent per-meeting conversation
   and can be stopped without discarding the text already received.

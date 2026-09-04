@@ -280,6 +280,19 @@ struct MeetingSettings: View {
             }
 
             Card(
+                title: "Automatic notes",
+                footnote: "After the transcript is ready, your local model writes a summary and gives the meeting a descriptive title. Meetings waiting on another summary are handled in order."
+            ) {
+                SettingRow(
+                    label: "Summarize completed meetings",
+                    detail: runtime.canAskLocalAI ? nil : "Choose a summary model in Local AI first."
+                ) {
+                    Toggle("", isOn: $settings.payload.automaticallySummarizeMeetings)
+                        .disabled(!runtime.canAskLocalAI)
+                }
+            }
+
+            Card(
                 title: "Recordings",
                 footnote: settings.payload.meetingAudioRetention.explanation
             ) {
