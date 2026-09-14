@@ -33,8 +33,32 @@ struct AppDatabaseTests {
         #expect(detail.segments.first?.speaker == "Speaker 2")
         #expect(try database.search("locally").first?.id == session.id)
 
+        let transcriptFile = try database.exportMeetingFile(id: session.id, kind: .transcript)
+        let notesFile = try database.exportMeetingFile(id: session.id, kind: .notes)
+        #expect(transcriptFile.pathExtension == "txt")
+        #expect(notesFile.pathExtension == "md")
+        #expect(try String(contentsOf: transcriptFile, encoding: .utf8) == detail.annotatedTranscript)
+        #expect(try String(contentsOf: notesFile, encoding: .utf8) == "Ship the recorder")
+        try database.updateSegment(id: segment.id, text: "Обновлённый текст", speaker: "Гриша")
+        let refreshedFile = try database.exportMeetingFile(id: session.id, kind: .transcript)
+        #expect(refreshedFile == transcriptFile)
+        #expect(try String(contentsOf: refreshedFile, encoding: .utf8).contains("Обновлённый текст"))
+        #expect(try String(contentsOf: refreshedFile, encoding: .utf8).contains("Гриша"))
+
+        // A failed write propagates instead of returning a nonexistent file path.
+        try FileManager.default.removeItem(at: notesFile)
+        try FileManager.default.createDirectory(at: notesFile, withIntermediateDirectories: false)
+        #expect(throws: (any Error).self) {
+            try database.exportMeetingFile(id: session.id, kind: .notes)
+        }
+
         try database.deleteSession(id: session.id)
         #expect(try database.sessionDetail(id: session.id) == nil)
+        #expect(!FileManager.default.fileExists(atPath: transcriptFile.path))
+        #expect(!FileManager.default.fileExists(atPath: notesFile.path))
+        #expect(throws: (any Error).self) {
+            try database.exportMeetingFile(id: session.id, kind: .transcript)
+        }
     }
 
     @Test func marksInFlightRecordingInterruptedAfterRestart() throws {

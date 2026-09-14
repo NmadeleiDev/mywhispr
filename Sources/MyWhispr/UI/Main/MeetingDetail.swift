@@ -289,6 +289,25 @@ struct MeetingDetail: View {
                 ) { runtime.copy(detail.transcript, note: "Transcript copied.") }
             }
 
+            if detail.session.state == .completed, mode == .transcript || mode == .notes {
+                Button {
+                    runtime.copyMeetingFilePath(
+                        id: detail.session.id, kind: mode == .notes ? .notes : .transcript
+                    )
+                } label: {
+                    Label("Copy file path", systemImage: "link")
+                }
+                .buttonStyle(.glass)
+                .controlSize(.small)
+                .disabled(mode == .notes
+                    ? editingSummary || runtime.summaryGeneration.isGenerating(for: detail.session.id)
+                        || (detail.session.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    : detail.segments.isEmpty)
+                .help(mode == .notes
+                    ? "Save the current notes as Markdown and copy the file path"
+                    : "Save the current transcript with speakers and timestamps and copy the file path")
+            }
+
             if detail.session.state == .failed || detail.session.state == .interrupted {
                 Button {
                     runtime.retrySession(id: detail.session.id)

@@ -1293,6 +1293,15 @@ final class AppRuntime {
 
     // MARK: - Reuse
 
+    func copyMeetingFilePath(id: UUID, kind: AppDatabase.MeetingFile) {
+        do {
+            let url = try database.exportMeetingFile(id: id, kind: kind)
+            copy(url.path, note: "\(kind == .notes ? "Notes" : "Transcript") file path copied.")
+        } catch {
+            toast.present("Could not save the file: \(error.localizedDescription)", tone: .failure)
+        }
+    }
+
     func copy(_ text: String, note: String?) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)

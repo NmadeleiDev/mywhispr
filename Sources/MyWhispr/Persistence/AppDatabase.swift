@@ -944,6 +944,28 @@ final class AppDatabase: @unchecked Sendable {
         )
     }
 
+    enum MeetingFile: String {
+        case transcript
+        case notes
+    }
+
+    /// Exports the latest saved content. Stable filenames survive meeting renames.
+    func exportMeetingFile(id: UUID, kind: MeetingFile) throws -> URL {
+        guard let detail = try sessionDetail(id: id),
+              detail.session.kind == .meeting, detail.session.state == .completed else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        let content = kind == .transcript ? detail.annotatedTranscript : (detail.session.summary ?? "")
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        let directory = rootURL.appending(path: "Exports/\(id.uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appending(path: kind == .transcript ? "transcript.txt" : "notes.md")
+        try content.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
     func deleteSession(id: UUID, fileManager: FileManager = .default) throws {
         let relativePath = try queue.read { db in
             try String.fetchOne(db, sql: "SELECT audioRelativePath FROM sessions WHERE id = ?", arguments: [id])
@@ -953,6 +975,10 @@ final class AppDatabase: @unchecked Sendable {
             if fileManager.fileExists(atPath: fileURL.path) {
                 try fileManager.removeItem(at: fileURL)
             }
+        }
+        let exports = rootURL.appending(path: "Exports/\(id.uuidString)", directoryHint: .isDirectory)
+        if fileManager.fileExists(atPath: exports.path) {
+            try fileManager.removeItem(at: exports)
         }
         try queue.write { db in
             try db.execute(sql: "DELETE FROM sessionSearch WHERE sessionID = ?", arguments: [id])

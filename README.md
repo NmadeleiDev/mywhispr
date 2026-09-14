@@ -363,6 +363,14 @@ What MyWhispr stores by default:
 - Search index: transcript and title content only; meeting questions are not added
   to search
 
+Use **Copy file path** in a meeting’s Transcript or Notes tab to export the
+current saved content and copy its absolute path. Transcripts include speakers
+and timestamps (`transcript.txt`); notes preserve Markdown (`notes.md`). Exports
+live in `Exports/<meeting-id>/` inside the application data folder. Clicking again
+refreshes the same file; edits do not update an earlier export until you click
+again. Deleting the meeting also removes its exports. The original content stays
+in `MyWhispr.sqlite`.
+
 Application data is stored under:
 
 ```text
