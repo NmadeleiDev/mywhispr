@@ -141,4 +141,148 @@ struct AppDatabaseTests {
         #expect(try database.sessionDetail(id: id) == nil)
         #expect(!FileManager.default.fileExists(atPath: audioURL.path))
     }
+
+    @Test func clearsOnlyCompletedMeetingAudioAndPreservesContent() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/test-data-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try AppDatabase(rootURL: root)
+        let now = Date()
+        let cases: [(WorkflowKind, SessionState)] = [
+            (.meeting, .completed), (.meeting, .failed), (.meeting, .interrupted),
+            (.meeting, .recording), (.meeting, .processing),
+            (.dictation, .completed), (.dictation, .failed),
+        ]
+        var fixtures: [SessionRecord] = []
+        for (kind, state) in cases {
+            let id = UUID()
+            let relativePath = "Audio/\(id.uuidString)"
+            let directory = root.appending(path: relativePath)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for track in ["microphone.caf", "system.caf"] {
+                try Data("audio".utf8).write(to: directory.appending(path: track))
+            }
+            let session = SessionRecord(
+                id: id, kind: kind, title: "Meeting", state: state,
+                startedAt: now, endedAt: now, duration: 60,
+                sourceApplication: nil, sourceBundleIdentifier: nil,
+                modelSnapshot: "{}", audioRelativePath: relativePath, summary: "Keep these notes",
+                errorMessage: nil, createdAt: now, updatedAt: now
+            )
+            try database.insertSession(session)
+            try database.replaceSegments([TranscriptSegmentRecord(
+                id: UUID(), sessionID: id, position: 0, start: 0, end: 4,
+                channel: .system, speaker: "Speaker 1", originalText: "Keep these words",
+                editedText: "Keep these words"
+            )], for: session)
+            fixtures.append(session)
+        }
+
+        // A filesystem failure is reported, and the audio reference remains retryable.
+        #expect(throws: (any Error).self) {
+            try database.clearCompletedMeetingRecordings(fileManager: RefusingAudioRemoval())
+        }
+        #expect(try database.sessionDetail(id: fixtures[0].id)?.session.audioRelativePath == fixtures[0].audioRelativePath)
+
+        #expect(try database.clearCompletedMeetingRecordings() == 1)
+        for session in fixtures {
+            let detail = try #require(try database.sessionDetail(id: session.id))
+            let cleared = session.kind == .meeting && session.state == .completed
+            #expect(detail.session.audioRelativePath == (cleared ? nil : session.audioRelativePath))
+            #expect(detail.session.state == session.state)
+            #expect(detail.session.summary == "Keep these notes")
+            #expect(detail.transcript == "Keep these words")
+            let directory = root.appending(path: try #require(session.audioRelativePath))
+            for track in ["microphone.caf", "system.caf"] {
+                #expect(FileManager.default.fileExists(atPath: directory.appending(path: track).path) == !cleared)
+            }
+        }
+        #expect(try database.search("words").count == fixtures.count)
+        #expect(try database.clearCompletedMeetingRecordings() == 0)
+
+        // A stale reference to already-missing audio is cleared without losing text.
+        var missing = fixtures[0]
+        missing.audioRelativePath = "Audio/already-missing"
+        try database.updateSession(missing)
+        #expect(try database.clearCompletedMeetingRecordings() == 1)
+        #expect(try database.sessionDetail(id: missing.id)?.session.audioRelativePath == nil)
+        #expect(try database.sessionDetail(id: missing.id)?.transcript == "Keep these words")
+    }
+
+    @Test func tagsAttachFilterAndPruneWhenUnused() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/test-data-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try AppDatabase(rootURL: root)
+        let now = Date()
+
+        func meeting(_ title: String) -> SessionRecord {
+            SessionRecord(
+                id: UUID(), kind: .meeting, title: title, state: .completed,
+                startedAt: now, endedAt: now, duration: 30,
+                sourceApplication: nil, sourceBundleIdentifier: nil,
+                modelSnapshot: "{}", audioRelativePath: nil, summary: nil,
+                errorMessage: nil, createdAt: now, updatedAt: now
+            )
+        }
+
+        let design = meeting("Design review")
+        let standup = meeting("Standup")
+        let planning = meeting("Planning")
+        try database.insertSession(design)
+        try database.insertSession(standup)
+        try database.insertSession(planning)
+
+        let work = try #require(try database.addTag(named: "  Work  ", to: design.id))
+        #expect(work.name == "Work")
+        // Case-insensitive reuse keeps the first-seen casing.
+        let again = try #require(try database.addTag(named: "work", to: standup.id))
+        #expect(again.id == work.id)
+        #expect(again.name == "Work")
+        let client = try #require(try database.addTag(named: "Client", to: design.id))
+        _ = try database.addTag(named: "Client", to: planning.id)
+
+        #expect(try database.addTag(named: "   ", to: design.id) == nil)
+
+        let designDetail = try #require(try database.sessionDetail(id: design.id))
+        #expect(designDetail.tags.map(\.name).sorted() == ["Client", "Work"])
+
+        let byWork = try database.recentSessions(kind: .meeting, matchingAnyTagIDs: [work.id])
+        #expect(Set(byWork.map(\.id)) == [design.id, standup.id])
+
+        let byEither = try database.recentSessions(
+            kind: .meeting,
+            matchingAnyTagIDs: [work.id, client.id]
+        )
+        #expect(Set(byEither.map(\.id)) == [design.id, standup.id, planning.id])
+
+        try database.replaceSegments([
+            TranscriptSegmentRecord(
+                id: UUID(), sessionID: design.id, position: 0, start: 0, end: 2,
+                channel: .system, speaker: "A", originalText: "ship it",
+                editedText: "ship it"
+            )
+        ], for: design)
+        let searched = try database.search(
+            "ship",
+            kind: .meeting,
+            matchingAnyTagIDs: [client.id]
+        )
+        #expect(searched.map(\.id) == [design.id])
+
+        try database.removeTag(id: work.id, from: design.id)
+        #expect(try database.allTags().map(\.name).sorted() == ["Client", "Work"])
+        try database.removeTag(id: work.id, from: standup.id)
+        #expect(try database.allTags().map(\.name) == ["Client"])
+
+        try database.deleteSession(id: design.id)
+        try database.deleteSession(id: planning.id)
+        #expect(try database.allTags().isEmpty)
+    }
+}
+
+private final class RefusingAudioRemoval: FileManager, @unchecked Sendable {
+    override func removeItem(at URL: URL) throws {
+        throw CocoaError(.fileWriteNoPermission)
+    }
 }

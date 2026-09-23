@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import SwiftUI
 import Testing
 @testable import MyWhispr
@@ -98,6 +99,40 @@ struct UIRenderTests {
             size: NSSize(width: 760, height: 260),
             filename: "mywhispr-expanded-source.png"
         )
+    }
+
+    @Test func clearingRecordingsRefreshesSelectedMeetingAndPlayback() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/render-data-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try makeFixture(at: root)
+        let database = try AppDatabase(rootURL: root)
+        var session = try #require(try database.recentSessions(kind: .meeting).first)
+        session.audioRelativePath = "Audio/\(session.id.uuidString)"
+        let directory = root.appending(path: try #require(session.audioRelativePath))
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let format = try #require(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+        do {
+            let file = try AVAudioFile(forWriting: directory.appending(path: "microphone.caf"), settings: format.settings)
+            let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 1_600))
+            buffer.frameLength = 1_600
+            let samples = try #require(buffer.floatChannelData)[0]
+            for index in 0..<1_600 { samples[index] = 0 }
+            try file.write(from: buffer)
+        }
+        try database.updateSession(session)
+        let runtime = try AppRuntime(databaseRootURL: root)
+        runtime.selectedSessionID = session.id
+        #expect(runtime.selectedDetail?.session.audioRelativePath != nil)
+        #expect(runtime.playback.duration > 0)
+        runtime.clearCompletedMeetingRecordings()
+
+        #expect(runtime.selectedDetail?.session.audioRelativePath == nil)
+        #expect(runtime.selectedDetail?.session.summary == session.summary)
+        #expect(runtime.selectedDetail?.transcript == "Move the public launch to October.")
+        #expect(runtime.playback.duration == 0)
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+        #expect(try database.chatMessages(for: .allMeetings).count == 2)
     }
 
     private func render(

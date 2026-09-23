@@ -17,6 +17,7 @@ final class HUDPresenter {
     @ObservationIgnored private var dismissTask: Task<Void, Never>?
     @ObservationIgnored private var collapseTask: Task<Void, Never>?
     @ObservationIgnored private var meetingCollapsed = false
+    @ObservationIgnored private var dismissedMeetingStartedAt: Date?
     @ObservationIgnored private weak var runtime: AppRuntime?
 
     /// How long a terminal state stays on screen before the pill shrinks away.
@@ -62,6 +63,11 @@ final class HUDPresenter {
 
         case .recording(.meeting, let startedAt):
             cancelDismiss()
+            guard dismissedMeetingStartedAt != startedAt else {
+                transition(to: .hidden)
+                return
+            }
+            dismissedMeetingStartedAt = nil
             scheduleMeetingCollapse()
             transition(to: .meeting(startedAt: startedAt, collapsed: meetingCollapsed))
 
@@ -112,6 +118,13 @@ final class HUDPresenter {
     func dismissImmediately() {
         cancelDismiss()
         transition(to: .hidden)
+    }
+
+    /// Hides only this recording's timer; capture and processing remain untouched.
+    func hideMeetingTimer() {
+        guard case .meeting(let startedAt, _) = state else { return }
+        dismissedMeetingStartedAt = startedAt
+        dismissImmediately()
     }
 
     // MARK: - Panel lifecycle
@@ -200,6 +213,7 @@ private struct HUDHost: View {
                 meter: runtime.meter,
                 onCancel: { runtime.cancelDictation() },
                 onStopMeeting: { runtime.stopMeeting() },
+                onHideMeeting: { presenter.hideMeetingTimer() },
                 onCancelProcessing: { runtime.cancelProcessing() }
             )
         }

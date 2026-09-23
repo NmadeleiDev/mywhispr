@@ -49,6 +49,12 @@ enum Palette {
         }
         return speakers[Int(hash % UInt64(speakers.count))]
     }
+
+    /// Tag chips reuse the same calm palette as speakers, keyed by the tag name
+    /// (case-insensitive) so a tag keeps one colour wherever it appears.
+    static func tag(_ name: String) -> Color {
+        speaker(name.lowercased())
+    }
 }
 
 enum Metrics {

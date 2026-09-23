@@ -8,11 +8,16 @@ import SwiftUI
 /// answer, so a healthy list is pure content with no status noise.
 struct SessionList: View {
     var sessions: [SessionRecord]
+    var tagsBySessionID: [UUID: [TagRecord]] = [:]
+    var availableTags: [TagRecord] = []
     var kind: WorkflowKind
     @Binding var selection: UUID?
     var searchText: String
+    var hasActiveTagFilter = false
     var summaryGenerationSessionID: UUID?
     var onDelete: (UUID) -> Void
+    var onAddTag: ((UUID, String) -> Void)? = nil
+    var onRemoveTag: ((UUID, UUID) -> Void)? = nil
 
     var body: some View {
         List(selection: $selection) {
@@ -21,9 +26,13 @@ struct SessionList: View {
                     ForEach(group.sessions) { session in
                         SessionRow(
                             session: session,
+                            tags: tagsBySessionID[session.id] ?? [],
+                            availableTags: availableTags,
                             isSelected: selection == session.id,
                             isGeneratingSummary: summaryGenerationSessionID == session.id,
-                            onDelete: { onDelete(session.id) }
+                            onDelete: { onDelete(session.id) },
+                            onAddTag: onAddTag.map { handler in { handler(session.id, $0) } },
+                            onRemoveTag: onRemoveTag.map { handler in { handler(session.id, $0) } }
                         )
                             .tag(session.id)
                             .contextMenu {
@@ -49,7 +58,7 @@ struct SessionList: View {
 
     @ViewBuilder
     private var emptyState: some View {
-        if !searchText.isEmpty {
+        if !searchText.isEmpty || hasActiveTagFilter {
             EmptyStateView(icon: "magnifyingglass", message: "No matches")
         } else {
             switch kind {
@@ -123,11 +132,16 @@ enum SessionRowStatus: Equatable {
 
 struct SessionRow: View {
     var session: SessionRecord
+    var tags: [TagRecord] = []
+    var availableTags: [TagRecord] = []
     var isSelected = false
     var isGeneratingSummary = false
     var onDelete: () -> Void = {}
+    var onAddTag: ((String) -> Void)? = nil
+    var onRemoveTag: ((UUID) -> Void)? = nil
 
     @State private var hovered = false
+    @State private var editingTags = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -157,9 +171,56 @@ struct SessionRow: View {
                 stateBadge
             }
             .font(.system(size: 11))
+
+            if session.kind == .meeting, onAddTag != nil, onRemoveTag != nil {
+                tagSection
+            }
         }
         .padding(.vertical, 3)
         .onHover { hovered = $0 }
+    }
+
+    @ViewBuilder
+    private var tagSection: some View {
+        if editingTags {
+            TagEditor(
+                tags: tags,
+                catalog: availableTags,
+                compact: true,
+                onAdd: { name in
+                    onAddTag?(name)
+                },
+                onRemove: { id in
+                    onRemoveTag?(id)
+                }
+            )
+            .onExitCommand { editingTags = false }
+        } else if !tags.isEmpty || hovered || isSelected {
+            HStack(spacing: 4) {
+                ForEach(tags.prefix(3)) { tag in
+                    TagChip(name: tag.name, compact: true) {
+                        onRemoveTag?(tag.id)
+                    }
+                }
+                if tags.count > 3 {
+                    Text("+\(tags.count - 3)")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                }
+                Button {
+                    editingTags = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .bold))
+                        .frame(width: 16, height: 16)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tertiary)
+                .help("Add tag")
+                .opacity(hovered || isSelected || tags.isEmpty ? 1 : 0)
+                Spacer(minLength: 0)
+            }
+        }
     }
 
     private var displayTitle: String {

@@ -298,6 +298,28 @@ final class AppDatabase: @unchecked Sendable {
             )
             for id in meetingIDs { try Self.rebuildSearchIndex(for: id, db: db) }
         }
+        migrator.registerMigration("v8-session-tags") { db in
+            // Names are unique case-insensitively so "Work" and "work" collapse,
+            // but the first-seen casing is what the owner keeps seeing.
+            try db.execute(sql: """
+                CREATE TABLE tags (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    createdAt DATETIME NOT NULL
+                )
+                """)
+            try db.create(table: "sessionTags") { table in
+                table.column("sessionID", .text)
+                    .notNull()
+                    .indexed()
+                    .references("sessions", onDelete: .cascade)
+                table.column("tagID", .text)
+                    .notNull()
+                    .indexed()
+                    .references("tags", onDelete: .cascade)
+                table.primaryKey(["sessionID", "tagID"])
+            }
+        }
         return migrator
     }
 
@@ -670,11 +692,19 @@ final class AppDatabase: @unchecked Sendable {
         }
     }
 
-    func recentSessions(kind: WorkflowKind? = nil, limit: Int = 200) throws -> [SessionRecord] {
+    func recentSessions(
+        kind: WorkflowKind? = nil,
+        matchingAnyTagIDs: Set<UUID> = [],
+        limit: Int = 200
+    ) throws -> [SessionRecord] {
         try queue.read { db in
-            var request = SessionRecord.order(Column("startedAt").desc)
-            if let kind { request = request.filter(Column("kind") == kind) }
-            return try request.limit(limit).fetchAll(db)
+            try Self.fetchSessions(
+                db: db,
+                kind: kind,
+                matchingAnyTagIDs: matchingAnyTagIDs,
+                searchPattern: nil,
+                limit: limit
+            )
         }
     }
 
@@ -685,13 +715,21 @@ final class AppDatabase: @unchecked Sendable {
                 .filter(Column("sessionID") == id)
                 .order(Column("position"))
                 .fetchAll(db)
-            return SessionDetail(session: session, segments: segments)
+            let tags = try Self.tags(for: [id], db: db)[id] ?? []
+            return SessionDetail(session: session, segments: segments, tags: tags)
         }
     }
 
-    func search(_ query: String, kind: WorkflowKind? = nil, limit: Int = 100) throws -> [SessionRecord] {
+    func search(
+        _ query: String,
+        kind: WorkflowKind? = nil,
+        matchingAnyTagIDs: Set<UUID> = [],
+        limit: Int = 100
+    ) throws -> [SessionRecord] {
         let normalized = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else { return try recentSessions(kind: kind, limit: limit) }
+        guard !normalized.isEmpty else {
+            return try recentSessions(kind: kind, matchingAnyTagIDs: matchingAnyTagIDs, limit: limit)
+        }
         // FTS5 treats bare punctuation as syntax. Quoting each term keeps a search
         // for `C++` or `don't` from failing with a parse error instead of results.
         let pattern = normalized
@@ -699,20 +737,230 @@ final class AppDatabase: @unchecked Sendable {
             .map { "\"\($0.replacingOccurrences(of: "\"", with: "\"\""))\"" }
             .joined(separator: " ")
         return try queue.read { db in
+            try Self.fetchSessions(
+                db: db,
+                kind: kind,
+                matchingAnyTagIDs: matchingAnyTagIDs,
+                searchPattern: pattern,
+                limit: limit
+            )
+        }
+    }
+
+    // MARK: - Tags
+
+    func allTags() throws -> [TagRecord] {
+        try queue.read { db in
+            try TagRecord.order(Column("name").collating(.nocase)).fetchAll(db)
+        }
+    }
+
+    func tags(for sessionIDs: [UUID]) throws -> [UUID: [TagRecord]] {
+        try queue.read { db in try Self.tags(for: sessionIDs, db: db) }
+    }
+
+    /// Attaches a tag by name, creating the catalog entry when needed.
+    ///
+    /// Names are matched case-insensitively; the first-seen casing is kept.
+    @discardableResult
+    func addTag(named rawName: String, to sessionID: UUID) throws -> TagRecord? {
+        let name = Self.normalizedTagName(rawName)
+        guard !name.isEmpty else { return nil }
+        return try queue.write { db in
+            guard try SessionRecord.fetchOne(db, key: sessionID) != nil else { return nil }
+            let tag = try Self.findOrCreateTag(named: name, db: db)
+            try SessionTagRecord(sessionID: sessionID, tagID: tag.id).insert(db, onConflict: .ignore)
+            return tag
+        }
+    }
+
+    func removeTag(id tagID: UUID, from sessionID: UUID) throws {
+        try queue.write { db in
+            try db.execute(
+                sql: "DELETE FROM sessionTags WHERE sessionID = ? AND tagID = ?",
+                arguments: [sessionID, tagID]
+            )
+            try Self.pruneUnusedTags(db: db)
+        }
+    }
+
+    /// Meetings with notes but no tags — candidates for local-model labelling.
+    func meetingsEligibleForTagSuggestion(limit: Int = 500) throws -> [SessionRecord] {
+        try queue.read { db in
             try SessionRecord.fetchAll(
                 db,
                 sql: """
+                    SELECT sessions.* FROM sessions
+                    WHERE sessions.kind = ?
+                      AND sessions.summary IS NOT NULL
+                      AND TRIM(sessions.summary) != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM sessionTags
+                          WHERE sessionTags.sessionID = sessions.id
+                      )
+                    ORDER BY sessions.startedAt DESC
+                    LIMIT ?
+                    """,
+                arguments: [WorkflowKind.meeting, limit]
+            )
+        }
+    }
+
+    /// Recent summaries already labelled with each catalog tag, for few-shot prompts.
+    func tagCatalogExamples(
+        examplesPerTag: Int,
+        maxSummaryCharacters: Int,
+        excludingSessionID: UUID? = nil
+    ) throws -> [TagCatalogExample] {
+        guard examplesPerTag > 0 else { return [] }
+        return try queue.read { db in
+            let tags = try TagRecord.order(Column("name").collating(.nocase)).fetchAll(db)
+            guard !tags.isEmpty else { return [] }
+
+            var arguments: [any DatabaseValueConvertible] = []
+            var sql = """
+                SELECT sessionTags.tagID AS tagID, sessions.summary AS summary, sessions.startedAt AS startedAt
+                FROM sessionTags
+                JOIN sessions ON sessions.id = sessionTags.sessionID
+                WHERE sessions.kind = ?
+                  AND sessions.summary IS NOT NULL
+                  AND TRIM(sessions.summary) != ''
+                """
+            arguments.append(WorkflowKind.meeting)
+            if let excludingSessionID {
+                sql += " AND sessions.id != ?"
+                arguments.append(excludingSessionID)
+            }
+            sql += " ORDER BY sessions.startedAt DESC"
+
+            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
+            var summariesByTag: [UUID: [String]] = [:]
+            for row in rows {
+                let tagID: UUID = row["tagID"]
+                guard (summariesByTag[tagID]?.count ?? 0) < examplesPerTag else { continue }
+                let summary: String = row["summary"]
+                let clipped = Self.clipSummary(summary, limit: maxSummaryCharacters)
+                guard !clipped.isEmpty else { continue }
+                summariesByTag[tagID, default: []].append(clipped)
+            }
+
+            return tags.compactMap { tag in
+                guard let summaries = summariesByTag[tag.id], !summaries.isEmpty else { return nil }
+                return TagCatalogExample(tag: tag, summaries: summaries)
+            }
+        }
+    }
+
+    private static func clipSummary(_ text: String, limit: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > limit else { return trimmed }
+        let end = trimmed.index(trimmed.startIndex, offsetBy: limit)
+        return String(trimmed[..<end]).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+
+    private static func normalizedTagName(_ raw: String) -> String {
+        raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func findOrCreateTag(named name: String, db: Database) throws -> TagRecord {
+        if let existing = try TagRecord
+            .filter(Column("name").collating(.nocase) == name)
+            .fetchOne(db) {
+            return existing
+        }
+        let tag = TagRecord(id: UUID(), name: name, createdAt: Date())
+        try tag.insert(db)
+        return tag
+    }
+
+    private static func tags(for sessionIDs: [UUID], db: Database) throws -> [UUID: [TagRecord]] {
+        guard !sessionIDs.isEmpty else { return [:] }
+        let placeholders = Array(repeating: "?", count: sessionIDs.count).joined(separator: ", ")
+        let rows = try Row.fetchAll(
+            db,
+            sql: """
+                SELECT sessionTags.sessionID AS sessionID, tags.*
+                FROM sessionTags
+                JOIN tags ON tags.id = sessionTags.tagID
+                WHERE sessionTags.sessionID IN (\(placeholders))
+                ORDER BY tags.name COLLATE NOCASE
+                """,
+            arguments: StatementArguments(sessionIDs)
+        )
+        var result: [UUID: [TagRecord]] = [:]
+        for row in rows {
+            let sessionID: UUID = row["sessionID"]
+            let tag = try TagRecord(row: row)
+            result[sessionID, default: []].append(tag)
+        }
+        return result
+    }
+
+    private static func pruneUnusedTags(db: Database) throws {
+        try db.execute(sql: """
+            DELETE FROM tags
+            WHERE id NOT IN (SELECT DISTINCT tagID FROM sessionTags)
+            """)
+    }
+
+    private static func fetchSessions(
+        db: Database,
+        kind: WorkflowKind?,
+        matchingAnyTagIDs: Set<UUID>,
+        searchPattern: String?,
+        limit: Int
+    ) throws -> [SessionRecord] {
+        let tagIDs = Array(matchingAnyTagIDs)
+        var arguments: [any DatabaseValueConvertible] = []
+
+        if let searchPattern {
+            var sql = """
                 SELECT sessions.* FROM sessionSearch
                 JOIN sessions ON sessions.id = sessionSearch.sessionID
                 WHERE sessionSearch MATCH ?
-                \(kind == nil ? "" : "AND sessions.kind = ?")
-                ORDER BY rank LIMIT ?
-                """,
-                arguments: kind == nil
-                    ? StatementArguments([pattern, limit] as [any DatabaseValueConvertible])
-                    : StatementArguments([pattern, kind!, limit] as [any DatabaseValueConvertible])
-            )
+                """
+            arguments.append(searchPattern)
+            if let kind {
+                sql += " AND sessions.kind = ?"
+                arguments.append(kind)
+            }
+            if !tagIDs.isEmpty {
+                let placeholders = Array(repeating: "?", count: tagIDs.count).joined(separator: ", ")
+                sql += """
+                     AND sessions.id IN (
+                        SELECT sessionID FROM sessionTags
+                        WHERE tagID IN (\(placeholders))
+                    )
+                    """
+                arguments.append(contentsOf: tagIDs)
+            }
+            sql += " ORDER BY rank LIMIT ?"
+            arguments.append(limit)
+            return try SessionRecord.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
         }
+
+        var sql = "SELECT sessions.* FROM sessions"
+        var clauses: [String] = []
+        if let kind {
+            clauses.append("sessions.kind = ?")
+            arguments.append(kind)
+        }
+        if !tagIDs.isEmpty {
+            let placeholders = Array(repeating: "?", count: tagIDs.count).joined(separator: ", ")
+            clauses.append("""
+                sessions.id IN (
+                    SELECT sessionID FROM sessionTags
+                    WHERE tagID IN (\(placeholders))
+                )
+                """)
+            arguments.append(contentsOf: tagIDs)
+        }
+        if !clauses.isEmpty {
+            sql += " WHERE " + clauses.joined(separator: " AND ")
+        }
+        sql += " ORDER BY sessions.startedAt DESC LIMIT ?"
+        arguments.append(limit)
+        return try SessionRecord.fetchAll(db, sql: sql, arguments: StatementArguments(arguments))
     }
 
     /// Passage-sized evidence for the all-meetings conversation.
@@ -984,6 +1232,7 @@ final class AppDatabase: @unchecked Sendable {
             try db.execute(sql: "DELETE FROM sessionSearch WHERE sessionID = ?", arguments: [id])
             try db.execute(sql: "DELETE FROM meetingPassageSearch WHERE sessionID = ?", arguments: [id])
             _ = try SessionRecord.deleteOne(db, key: id)
+            try Self.pruneUnusedTags(db: db)
         }
     }
 
@@ -1084,6 +1333,20 @@ final class AppDatabase: @unchecked Sendable {
             guard let size = try? manager.attributesOfItem(atPath: url.path)[.size] as? Int64 else { return }
             total += size
         }
+    }
+
+    /// Clears saved audio only for meetings whose transcription finished successfully.
+    /// Failed and in-flight recordings remain available for recovery.
+    func clearCompletedMeetingRecordings(fileManager: FileManager = .default) throws -> Int {
+        let ids = try queue.read { db in
+            try UUID.fetchAll(
+                db,
+                sql: "SELECT id FROM sessions WHERE kind = ? AND state = ? AND audioRelativePath IS NOT NULL",
+                arguments: [WorkflowKind.meeting, SessionState.completed]
+            )
+        }
+        for id in ids { try discardAudio(for: id, fileManager: fileManager) }
+        return ids.count
     }
 
     /// Deletes only a meeting's audio tracks, keeping its transcript and summary.

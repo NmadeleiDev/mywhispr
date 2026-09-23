@@ -209,7 +209,7 @@ actor LocalAIService {
         try await client(configuration: configuration, model: model).stream(request, onDelta: onDelta)
     }
 
-    private func client(configuration: LocalAIConfiguration, model: String) -> any LocalAIClient {
+    func client(configuration: LocalAIConfiguration, model: String) -> any LocalAIClient {
         switch configuration.provider {
         case .ollama:
             OllamaClient(baseURL: URL(string: configuration.baseURL)!, model: model)
@@ -218,7 +218,7 @@ actor LocalAIService {
         }
     }
 
-    private static func validate(configuration: LocalAIConfiguration) throws {
+    static func validate(configuration: LocalAIConfiguration) throws {
         guard let url = URL(string: configuration.baseURL),
               let host = url.host,
               ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
@@ -535,6 +535,7 @@ enum LocalAIError: LocalizedError, Equatable {
     case invalidEmbeddingResponse
     case invalidCitations
     case invalidSummaryResponse
+    case invalidTagSuggestionResponse
     case rewriteDivergedFromSpeech
     case timedOut
     case emptyAnswer
@@ -550,6 +551,7 @@ enum LocalAIError: LocalizedError, Equatable {
         case .invalidEmbeddingResponse: "The local model returned invalid search embeddings."
         case .invalidCitations: "The local model cited meeting evidence that was not provided. Ask again to generate a grounded answer."
         case .invalidSummaryResponse: "The local model did not return a usable title and summary. Try again."
+        case .invalidTagSuggestionResponse: "The local model did not return a usable tag list. Try again."
         case .rewriteDivergedFromSpeech: "The local model rewrote the dictation instead of tidying it."
         case .timedOut: "The local model did not answer in time."
         case .emptyAnswer: "The local model returned an empty answer."

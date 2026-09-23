@@ -8,6 +8,30 @@ the public API and release process stabilize.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-23
+
+### Added
+
+- Meeting tags with typeahead from the existing catalog, Enter-to-create, colored
+  chips in the Library list and meeting detail, and a multi-select OR filter on
+  the Meetings tab.
+- Optional local-model tag suggestions after a summary is written: the model sees
+  the new notes plus examples of already-tagged meetings, may only pick existing
+  catalog names, and never retags a meeting that already has tags.
+- Optional automatic meeting summaries and titles as soon as transcription
+  finishes, with a serialized queue when the local model is already busy.
+- Copy microphone and Mac-audio file paths from a meeting detail when recordings
+  are still on disk.
+- Hide the floating meeting timer for the current recording without stopping
+  capture; the timer returns for the next meeting.
+- Clear transcribed meeting recordings from Settings while keeping transcripts
+  and summaries.
+
+### Changed
+
+- Meeting Settings exposes toggles for automatic notes and automatic tags next to
+  the existing recording-retention controls.
+
 ## [0.3.0] - 2026-09-04
 
 ### Added

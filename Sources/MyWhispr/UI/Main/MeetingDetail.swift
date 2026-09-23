@@ -77,7 +77,20 @@ struct MeetingDetail: View {
                 transcriptSurface
             }
         }
-        .safeAreaInset(edge: .top, spacing: 0) { titleBar }
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                titleBar
+                TagEditor(
+                    tags: detail.tags,
+                    catalog: runtime.availableTags,
+                    onAdd: { runtime.addTag(named: $0, to: detail.session.id) },
+                    onRemove: { runtime.removeTag($0, from: detail.session.id) }
+                )
+                .padding(.horizontal, 20)
+                .padding(.bottom, 10)
+                .background(.bar)
+            }
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if mode == .ask, canAsk {
                 MeetingChatComposer(chat: runtime.meetingChat, runtime: runtime)

@@ -274,6 +274,10 @@ final class SettingsStore {
         /// workflow preference rather than part of the connection: changing local
         /// AI providers must not silently change what happens after a meeting.
         var automaticallySummarizeMeetings = false
+        /// After notes exist, ask the local model to attach tags from the existing
+        /// catalog. Skips meetings that already have any tags, and never creates
+        /// new catalog entries.
+        var automaticallyTagMeetings = true
 
         var launchAtLogin = false
         var playCues = true
@@ -330,6 +334,10 @@ final class SettingsStore {
             automaticallySummarizeMeetings = value(
                 .automaticallySummarizeMeetings,
                 fallback.automaticallySummarizeMeetings
+            )
+            automaticallyTagMeetings = value(
+                .automaticallyTagMeetings,
+                fallback.automaticallyTagMeetings
             )
             launchAtLogin = value(.launchAtLogin, fallback.launchAtLogin)
             playCues = value(.playCues, fallback.playCues)

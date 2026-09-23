@@ -195,6 +195,11 @@ struct SpeakerColourTests {
     @Test func theOwnerIsAlwaysTheSameWarmTone() {
         #expect(Palette.speaker("You") == Palette.selfSpeaker)
     }
+
+    @Test func tagsKeepAStableColourByNameIgnoringCase() {
+        #expect(Palette.tag("Work") == Palette.tag("work"))
+        #expect(Palette.tag("Client") == Palette.tag("Client"))
+    }
 }
 
 @Suite("Clock formatting")

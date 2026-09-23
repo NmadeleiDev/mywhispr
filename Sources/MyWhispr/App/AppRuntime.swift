@@ -198,6 +198,8 @@ final class AppRuntime {
     }
 
     private(set) var sessions: [SessionRecord] = []
+    private(set) var tagsBySessionID: [UUID: [TagRecord]] = [:]
+    private(set) var availableTags: [TagRecord] = []
     private(set) var recentDictations: [SessionRecord] = []
     private(set) var selectedDetail: SessionDetail?
     private(set) var localModelCatalog = LocalModelCatalog()
@@ -245,6 +247,18 @@ final class AppRuntime {
         didSet {
             guard filter != oldValue else { return }
             selectedSessionID = nil
+            if filter == .dictation, !selectedTagFilterIDs.isEmpty {
+                selectedTagFilterIDs = []
+            } else {
+                reloadSessions()
+            }
+        }
+    }
+
+    /// Library filter: show meetings that carry any of these tags.
+    var selectedTagFilterIDs: Set<UUID> = [] {
+        didSet {
+            guard selectedTagFilterIDs != oldValue else { return }
             reloadSessions()
         }
     }
@@ -286,6 +300,7 @@ final class AppRuntime {
     /// Deadline on the gap between "the key went down" and "audio is recording".
     private var dictationStartWatchdog: Task<Void, Never>?
     private var summaryTask: Task<Void, Never>?
+    private var tagSuggestionTask: Task<Void, Never>?
     @ObservationIgnored private var localModelDiscoveryTask: Task<Void, Never>?
     @ObservationIgnored private var meetingSemanticIndexTask: Task<Void, Never>?
     /// The in-flight transcribe/rewrite/insert chain, so it can be abandoned.
@@ -1395,6 +1410,44 @@ final class AppRuntime {
         }
     }
 
+    func addTag(named name: String, to sessionID: UUID) {
+        do {
+            guard try database.addTag(named: name, to: sessionID) != nil else { return }
+            loadSelectedDetail()
+            reloadSessions()
+        } catch {
+            fail(error)
+        }
+    }
+
+    func removeTag(_ tagID: UUID, from sessionID: UUID) {
+        do {
+            try database.removeTag(id: tagID, from: sessionID)
+            if selectedTagFilterIDs.contains(tagID) {
+                // Drop stale filter chips when the catalog entry is gone.
+                selectedTagFilterIDs = try Set(
+                    database.allTags().map(\.id)
+                ).intersection(selectedTagFilterIDs)
+            }
+            loadSelectedDetail()
+            reloadSessions()
+        } catch {
+            fail(error)
+        }
+    }
+
+    func toggleTagFilter(_ tagID: UUID) {
+        if selectedTagFilterIDs.contains(tagID) {
+            selectedTagFilterIDs.remove(tagID)
+        } else {
+            selectedTagFilterIDs.insert(tagID)
+        }
+    }
+
+    func clearTagFilter() {
+        selectedTagFilterIDs = []
+    }
+
     func deleteSession(id: UUID) {
         do {
             if selectedSessionID == id {
@@ -1407,6 +1460,26 @@ final class AppRuntime {
             refreshStorageSizes()
         } catch {
             fail(error)
+        }
+    }
+
+    func clearCompletedMeetingRecordings() {
+        // Refresh even on partial failure: earlier deletions cannot be rolled back.
+        defer {
+            reloadSessions()
+            loadSelectedDetail()
+            refreshStorageSizes()
+        }
+        do {
+            let count = try database.clearCompletedMeetingRecordings()
+            toast.present(
+                count == 0 ? "No transcribed meeting recordings to clear."
+                    : "Recordings cleared. Transcripts and summaries are kept.",
+                tone: .success
+            )
+        } catch {
+            // A storage error must not reset an unrelated recording or transcription.
+            toast.present("Couldn't clear all recordings: \(error.localizedDescription)", tone: .failure)
         }
     }
 
@@ -1606,9 +1679,148 @@ final class AppRuntime {
             try database.updateSession(session)
             loadSelectedDetail()
             reloadSessions()
+            suggestTagsIfNeeded(for: sessionID)
         } catch {
             fail(error)
         }
+    }
+
+    /// Asks the local model to attach catalog tags after notes land.
+    ///
+    /// Never invents tags and never touches a meeting that already has any.
+    private func suggestTagsIfNeeded(for sessionID: UUID) {
+        let configuration = settings.payload.localAI
+        guard settings.payload.automaticallyTagMeetings else { return }
+        guard let detail = try? database.sessionDetail(id: sessionID) else { return }
+        let catalog = (try? database.allTags()) ?? []
+        guard AutomaticMeetingTagPolicy.shouldSuggest(
+            enabled: true,
+            configuration: configuration,
+            existingTags: detail.tags,
+            catalog: catalog,
+            summary: detail.session.summary
+        ) else { return }
+
+        let budget = MeetingTagSuggestionBudget.standard
+        let examples = (try? database.tagCatalogExamples(
+            examplesPerTag: budget.examplesPerTag,
+            maxSummaryCharacters: budget.maxExampleCharacters,
+            excludingSessionID: sessionID
+        )) ?? []
+        let title = detail.session.title
+        let summary = detail.session.summary ?? ""
+
+        tagSuggestionTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let suggestion = try await localAI.suggestTags(
+                    title: title,
+                    summary: summary,
+                    catalog: catalog,
+                    examples: examples,
+                    configuration: configuration,
+                    budget: budget
+                )
+                guard !Task.isCancelled else { return }
+                self.applySuggestedTags(suggestion.tagNames, to: sessionID)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.logger.error("Tag suggestion failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func applySuggestedTags(_ names: [String], to sessionID: UUID) {
+        guard let detail = try? database.sessionDetail(id: sessionID) else { return }
+        // A human may have tagged the meeting while the model was thinking.
+        guard detail.tags.isEmpty else { return }
+        guard !names.isEmpty else { return }
+        do {
+            for name in names {
+                _ = try database.addTag(named: name, to: sessionID)
+            }
+            loadSelectedDetail()
+            reloadSessions()
+        } catch {
+            fail(error)
+        }
+    }
+
+    /// One-shot labelling for summarized meetings that still have no tags.
+    ///
+    /// Used for local verification of the automatic-tag path; not started on launch.
+    func backfillSuggestedMeetingTags(
+        budget: MeetingTagSuggestionBudget = .standard,
+        limit: Int = 500
+    ) async -> (tagged: Int, skipped: Int, failed: Int) {
+        let configuration = settings.payload.localAI
+        guard canAskLocalAI else { return (0, 0, 0) }
+        let candidates = (try? database.meetingsEligibleForTagSuggestion(limit: limit)) ?? []
+        var tagged = 0
+        var skipped = 0
+        var failed = 0
+
+        for session in candidates {
+            guard let detail = try? database.sessionDetail(id: session.id) else {
+                skipped += 1
+                continue
+            }
+            let catalog = (try? database.allTags()) ?? []
+            guard AutomaticMeetingTagPolicy.shouldSuggest(
+                enabled: true,
+                configuration: configuration,
+                existingTags: detail.tags,
+                catalog: catalog,
+                summary: detail.session.summary
+            ) else {
+                skipped += 1
+                continue
+            }
+
+            let examples = (try? database.tagCatalogExamples(
+                examplesPerTag: budget.examplesPerTag,
+                maxSummaryCharacters: budget.maxExampleCharacters,
+                excludingSessionID: session.id
+            )) ?? []
+
+            do {
+                let suggestion = try await localAI.suggestTags(
+                    title: detail.session.title,
+                    summary: detail.session.summary ?? "",
+                    catalog: catalog,
+                    examples: examples,
+                    configuration: configuration,
+                    budget: budget
+                )
+                if suggestion.tagNames.isEmpty {
+                    skipped += 1
+                    continue
+                }
+                // Re-check emptiness in case the owner tagged meanwhile.
+                if let latest = try database.sessionDetail(id: session.id), !latest.tags.isEmpty {
+                    skipped += 1
+                    continue
+                }
+                for name in suggestion.tagNames {
+                    _ = try database.addTag(named: name, to: session.id)
+                }
+                tagged += 1
+                logger.info(
+                    "Backfill tagged \(session.title, privacy: .public) with \(suggestion.tagNames.joined(separator: ", "), privacy: .public)"
+                )
+            } catch {
+                failed += 1
+                logger.error(
+                    "Backfill tag failed for \(session.title, privacy: .public): \(error.localizedDescription)"
+                )
+            }
+        }
+
+        reloadSessions()
+        loadSelectedDetail()
+        return (tagged, skipped, failed)
     }
 
     // MARK: - Storage bookkeeping
@@ -1767,9 +1979,19 @@ final class AppRuntime {
     private func reloadSessions() {
         do {
             let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            let tagFilter = filter == .meeting ? selectedTagFilterIDs : []
             sessions = trimmed.isEmpty
-                ? try database.recentSessions(kind: filter)
-                : try database.search(trimmed, kind: filter)
+                ? try database.recentSessions(kind: filter, matchingAnyTagIDs: tagFilter)
+                : try database.search(trimmed, kind: filter, matchingAnyTagIDs: tagFilter)
+            tagsBySessionID = try database.tags(for: sessions.map(\.id))
+            availableTags = try database.allTags()
+            // Drop filter IDs that no longer exist in the catalog.
+            let known = Set(availableTags.map(\.id))
+            let pruned = selectedTagFilterIDs.intersection(known)
+            if pruned != selectedTagFilterIDs {
+                selectedTagFilterIDs = pruned
+                return
+            }
             recentDictations = try database.recentDictations()
         } catch {
             logger.error("History load failed: \(error.localizedDescription)")

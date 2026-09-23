@@ -6,6 +6,38 @@ import Testing
 @MainActor
 @Suite("HUD panel lifecycle", .serialized)
 struct HUDPresenterTests {
+    @Test("Hiding a meeting timer lasts for that recording only")
+    func hideMeetingTimer() throws {
+        let presenter = HUDPresenter()
+        defer { presenter.dismissImmediately() }
+        let startedAt = Date()
+        presenter.update(phase: .recording(.meeting, startedAt: startedAt), enabled: true)
+        let panel = try #require(NSApplication.shared.windows.compactMap { $0 as? HUDPanel }
+            .first { $0.isVisible })
+
+        presenter.hideMeetingTimer()
+        #expect(presenter.state == .hidden)
+        #expect(!panel.isVisible)
+        #expect(panel.contentView == nil)
+        presenter.update(phase: .recording(.meeting, startedAt: startedAt), enabled: true)
+        #expect(presenter.state == .hidden)
+        presenter.update(phase: .recording(.meeting, startedAt: startedAt), enabled: false)
+        presenter.update(phase: .recording(.meeting, startedAt: startedAt), enabled: true)
+        #expect(presenter.state == .hidden)
+
+        presenter.update(phase: .transcribing(.meeting, progress: 0.5), enabled: true)
+        #expect(presenter.state == .working(.meeting, .transcribing, progress: 0.5))
+        presenter.update(phase: .idle, enabled: true)
+        presenter.update(phase: .recording(.dictation, startedAt: startedAt), enabled: true)
+        presenter.hideMeetingTimer()
+        #expect(presenter.state == .listening(startedAt: startedAt))
+        presenter.update(phase: .idle, enabled: true)
+
+        let nextStart = startedAt.addingTimeInterval(60)
+        presenter.update(phase: .recording(.meeting, startedAt: nextStart), enabled: true)
+        #expect(presenter.state == .meeting(startedAt: nextStart, collapsed: false))
+    }
+
     @Test("A new visibility session receives a new panel")
     func renewsPanelAfterHiding() throws {
         let application = NSApplication.shared

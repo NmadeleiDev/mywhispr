@@ -53,6 +53,21 @@ struct SettingsStoreTests {
         #expect(!SettingsStore(defaults: defaults).payload.automaticallySummarizeMeetings)
     }
 
+    @Test("Automatic meeting tags default on and survive relaunch")
+    func persistsAutomaticMeetingTagsCompatibly() throws {
+        let suite = "MyWhisprTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.payload.automaticallyTagMeetings)
+        store.payload.automaticallyTagMeetings = false
+        #expect(!SettingsStore(defaults: defaults).payload.automaticallyTagMeetings)
+
+        defaults.set(Data(#"{"localAI":{"summaryModel":"local-model"}}"#.utf8), forKey: "settings.payload.v2")
+        #expect(SettingsStore(defaults: defaults).payload.automaticallyTagMeetings)
+    }
+
     @Test("Embedding model survives relaunch and old settings keep exact search")
     func persistsEmbeddingModelCompatibly() throws {
         let suite = "MyWhisprTests.\(UUID().uuidString)"

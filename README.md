@@ -58,7 +58,8 @@ question view.
   from a Unix-friendly command line.
 - **Local AI is optional.** Faithful transcription works without a language
   model server. Ollama, LM Studio, and other loopback OpenAI-compatible servers
-  can optionally polish dictation, summarize meetings, and answer questions.
+  can optionally polish dictation, summarize meetings, suggest tags from your
+  existing catalog, and answer questions.
 - **No artificial limits.** There are no paid tiers, quotas, locked features, or
   hosted services required by the project.
 
@@ -112,6 +113,8 @@ question view.
 - Record microphone input and Mac system output as separate local CAF tracks
   without changing the selected output device.
 - Display recording duration and live input level while capture is active.
+- Hide the floating meeting timer with its close button while recording continues;
+  the timer appears again for the next meeting.
 - Transcribe after recording stops, skip a silent track instead of failing the
   whole meeting, and de-duplicate acoustic echo between microphone and system
   audio.
@@ -121,13 +124,22 @@ question view.
   interrupted work, and retry failed or interrupted transcription from the saved
   audio.
 - Search meeting titles and transcript content with SQLite FTS5.
+- Attach tags to meetings by picking from the existing catalog or typing a new
+  name with filtered typeahead. Chips are colored by tag name, editable from the
+  list or the detail view, and filterable with a multi-select Meetings filter
+  that matches any selected tag.
 - Rename meetings and speakers, edit individual passages, select and copy text,
   copy the complete transcript, and delete meetings with confirmation.
+- Copy the on-disk path of a meeting's microphone or Mac-audio recording when the
+  file is still retained.
 - Play the two meeting tracks on one synchronized timeline. Click a transcript
   passage to seek, follow the active passage during playback, scrub the timeline,
   and use Space to play or pause when no text field is being edited.
 - Keep recordings for playback or delete them automatically after successful
   transcription while retaining the transcript.
+- Clear existing recordings in Settings → Meetings → Recordings. After confirmation,
+  only successfully transcribed meetings lose their audio; transcripts, summaries,
+  and failed or unfinished recordings are kept.
 
 #### Optional local-AI tools
 
@@ -140,6 +152,9 @@ question view.
 - Optionally generate those notes and the descriptive title automatically as soon
   as a meeting finishes transcribing, serializing meetings when the local model is
   already writing another summary.
+- Optionally suggest tags from the existing catalog after notes are written. The
+  model sees the new summary plus short examples of already-tagged meetings,
+  never invents tag names, and skips meetings that already have tags.
 - Ask follow-up questions against an entire meeting transcript, including speaker
   names and timestamps. Answers stream into a persistent per-meeting conversation
   and can be stopped without discarding the text already received.

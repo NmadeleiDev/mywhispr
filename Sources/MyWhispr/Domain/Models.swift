@@ -209,6 +209,22 @@ struct SessionRecord: Codable, FetchableRecord, PersistableRecord, Identifiable,
     var updatedAt: Date
 }
 
+/// A free-form label the owner attaches to meetings for browsing and filtering.
+struct TagRecord: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashable, Sendable {
+    static let databaseTableName = "tags"
+
+    var id: UUID
+    var name: String
+    var createdAt: Date
+}
+
+struct SessionTagRecord: Codable, FetchableRecord, PersistableRecord, Sendable {
+    static let databaseTableName = "sessionTags"
+
+    var sessionID: UUID
+    var tagID: UUID
+}
+
 struct TranscriptSegmentRecord: Codable, FetchableRecord, PersistableRecord, Identifiable, Sendable {
     static let databaseTableName = "transcriptSegments"
 
@@ -379,6 +395,7 @@ struct MeetingSourceTarget: Equatable, Sendable {
 struct SessionDetail: Sendable {
     var session: SessionRecord
     var segments: [TranscriptSegmentRecord]
+    var tags: [TagRecord] = []
 
     var transcript: String {
         segments.map(\.editedText).joined(separator: " ")

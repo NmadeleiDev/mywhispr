@@ -61,6 +61,7 @@ struct RecordingHUD: View {
     var meter: AudioLevelMeter
     var onCancel: () -> Void
     var onStopMeeting: () -> Void
+    var onHideMeeting: () -> Void
     var onCancelProcessing: () -> Void
 
     @Namespace private var glass
@@ -150,6 +151,16 @@ struct RecordingHUD: View {
                     .tint(Palette.accent)
                     .help("Stop the meeting")
                 }
+                Button(action: onHideMeeting) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(.circle)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Hide meeting timer")
+                .help("Hide timer · meeting keeps recording")
             }
 
         case .working(let kind, let stage, let progress):

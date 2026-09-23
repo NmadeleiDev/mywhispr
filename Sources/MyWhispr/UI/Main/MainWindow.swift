@@ -275,7 +275,8 @@ struct MainWindow: View {
     @ViewBuilder
     private var library: some View {
         @Bindable var runtime = runtime
-        if runtime.sessions.isEmpty, runtime.searchText.isEmpty {
+        let hasTagFilter = runtime.filter == .meeting && !runtime.selectedTagFilterIDs.isEmpty
+        if runtime.sessions.isEmpty, runtime.searchText.isEmpty, !hasTagFilter {
             VStack(spacing: 18) {
                 Picker("", selection: $runtime.filter) {
                     Text("Meetings").tag(WorkflowKind.meeting)
@@ -311,6 +312,10 @@ struct MainWindow: View {
                             prompt: runtime.filter == .dictation ? "Search dictations" : "Search meetings",
                             focused: $searchFocused
                         )
+
+                        if runtime.filter == .meeting {
+                            TagFilterBar(runtime: runtime)
+                        }
                     }
                     .padding(12)
 
@@ -318,11 +323,20 @@ struct MainWindow: View {
 
                     SessionList(
                         sessions: runtime.sessions,
+                        tagsBySessionID: runtime.tagsBySessionID,
+                        availableTags: runtime.availableTags,
                         kind: runtime.filter,
                         selection: $runtime.selectedSessionID,
                         searchText: runtime.searchText,
+                        hasActiveTagFilter: hasTagFilter,
                         summaryGenerationSessionID: runtime.summaryGeneration.sessionID,
-                        onDelete: { requestDelete($0) }
+                        onDelete: { requestDelete($0) },
+                        onAddTag: runtime.filter == .meeting
+                            ? { runtime.addTag(named: $1, to: $0) }
+                            : nil,
+                        onRemoveTag: runtime.filter == .meeting
+                            ? { runtime.removeTag($1, from: $0) }
+                            : nil
                     )
                 }
                 .frame(minWidth: 260, idealWidth: 310, maxWidth: 380)
@@ -343,21 +357,149 @@ struct MainWindow: View {
                 MeetingDetail(detail: detail, runtime: runtime)
             }
         } else {
+            let filtering = !runtime.searchText.isEmpty
+                || (runtime.filter == .meeting && !runtime.selectedTagFilterIDs.isEmpty)
             EmptyStateView(
                 icon: runtime.filter == .dictation ? "waveform" : "person.wave.2",
-                message: runtime.searchText.isEmpty
-                    ? (runtime.filter == .dictation ? "No dictations yet" : "No meetings yet")
-                    : "No matches",
-                actionTitle: runtime.searchText.isEmpty
-                    ? (runtime.filter == .dictation ? "Home" : "Start meeting")
-                    : nil,
-                action: runtime.searchText.isEmpty ? {
+                message: filtering
+                    ? "No matches"
+                    : (runtime.filter == .dictation ? "No dictations yet" : "No meetings yet"),
+                actionTitle: filtering
+                    ? nil
+                    : (runtime.filter == .dictation ? "Home" : "Start meeting"),
+                action: filtering ? nil : {
                     if runtime.filter == .meeting { runtime.startMeeting() }
                     else { destination = .home }
-                } : nil
+                }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+}
+
+/// Multiselect filter for the Meetings library: any selected tag matches.
+private struct TagFilterBar: View {
+    var runtime: AppRuntime
+
+    var body: some View {
+        if runtime.availableTags.isEmpty, runtime.selectedTagFilterIDs.isEmpty {
+            EmptyView()
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                    Text("Tags")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    if !runtime.selectedTagFilterIDs.isEmpty {
+                        Button("Clear") {
+                            runtime.clearTagFilter()
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Palette.accent)
+                    }
+                }
+
+                FlowTagFilter(
+                    tags: runtime.availableTags,
+                    selectedIDs: runtime.selectedTagFilterIDs,
+                    onToggle: { runtime.toggleTagFilter($0) }
+                )
+            }
+        }
+    }
+}
+
+private struct FlowTagFilter: View {
+    var tags: [TagRecord]
+    var selectedIDs: Set<UUID>
+    var onToggle: (UUID) -> Void
+
+    var body: some View {
+        // Reuse the public chip; wrap with the same flexible layout as TagEditor.
+        TagFilterWrap(spacing: 5) {
+            ForEach(tags) { tag in
+                Button {
+                    onToggle(tag.id)
+                } label: {
+                    TagChip(
+                        name: tag.name,
+                        compact: true,
+                        selected: selectedIDs.contains(tag.id)
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+/// Local wrap layout so the Library filter does not depend on TagEditor internals.
+private struct TagFilterWrap<Content: View>: View {
+    var spacing: CGFloat
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        TagFilterLayout(spacing: spacing) {
+            content
+        }
+    }
+}
+
+private struct TagFilterLayout: Layout {
+    var spacing: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let rows = arrange(proposal: proposal, subviews: subviews)
+        let width = proposal.width ?? rows.map(\.width).max() ?? 0
+        let height = rows.reduce(0) { $0 + $1.height } + CGFloat(max(0, rows.count - 1)) * spacing
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = arrange(proposal: ProposedViewSize(width: bounds.width, height: nil), subviews: subviews)
+        var y = bounds.minY
+        var index = 0
+        for row in rows {
+            var x = bounds.minX
+            for _ in 0..<row.count {
+                let size = subviews[index].sizeThatFits(.unspecified)
+                subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+                x += size.width + spacing
+                index += 1
+            }
+            y += row.height + spacing
+        }
+    }
+
+    private struct Row {
+        var count: Int
+        var width: CGFloat
+        var height: CGFloat
+    }
+
+    private func arrange(proposal: ProposedViewSize, subviews: Subviews) -> [Row] {
+        let maxWidth = proposal.width ?? .infinity
+        var rows: [Row] = []
+        var current = Row(count: 0, width: 0, height: 0)
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            let nextWidth = current.count == 0 ? size.width : current.width + spacing + size.width
+            if current.count > 0, nextWidth > maxWidth {
+                rows.append(current)
+                current = Row(count: 1, width: size.width, height: size.height)
+            } else {
+                current.count += 1
+                current.width = nextWidth
+                current.height = max(current.height, size.height)
+            }
+        }
+        if current.count > 0 { rows.append(current) }
+        return rows
     }
 }
 

@@ -257,6 +257,7 @@ struct DictationSettings: View {
 
 struct MeetingSettings: View {
     @Bindable var runtime: AppRuntime
+    @State private var confirmingClearRecordings = false
 
     var body: some View {
         @Bindable var settings = runtime.settings
@@ -293,6 +294,19 @@ struct MeetingSettings: View {
             }
 
             Card(
+                title: "Automatic tags",
+                footnote: "Uses the meeting summary and examples of already-tagged meetings. Only existing tags are considered, and meetings that already have tags are left alone."
+            ) {
+                SettingRow(
+                    label: "Suggest tags after summarizing",
+                    detail: runtime.canAskLocalAI ? nil : "Choose a summary model in Local AI first."
+                ) {
+                    Toggle("", isOn: $settings.payload.automaticallyTagMeetings)
+                        .disabled(!runtime.canAskLocalAI)
+                }
+            }
+
+            Card(
                 title: "Recordings",
                 footnote: settings.payload.meetingAudioRetention.explanation
             ) {
@@ -310,7 +324,27 @@ struct MeetingSettings: View {
                         .font(.system(size: 12, design: .rounded))
                         .foregroundStyle(.secondary)
                 }
+                HStack {
+                    Button("Clear existing recordings…", role: .destructive) {
+                        confirmingClearRecordings = true
+                    }
+                    .buttonStyle(.glass)
+                    .controlSize(.small)
+                    Spacer()
+                }
             }
+        }
+        .confirmationDialog(
+            "Clear recordings of transcribed meetings?",
+            isPresented: $confirmingClearRecordings,
+            titleVisibility: .visible
+        ) {
+            Button("Clear existing recordings", role: .destructive) {
+                runtime.clearCompletedMeetingRecordings()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Deletes audio only from successfully transcribed meetings. Transcripts and summaries are kept. Failed and unfinished recordings are kept. Playback will no longer be available. This cannot be undone.")
         }
     }
 }
