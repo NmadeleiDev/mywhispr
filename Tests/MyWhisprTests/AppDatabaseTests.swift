@@ -209,6 +209,47 @@ struct AppDatabaseTests {
         #expect(try database.sessionDetail(id: missing.id)?.transcript == "Keep these words")
     }
 
+    @Test func liveMeetingTagsSurviveProcessingAndCompletion() throws {
+        let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appending(path: ".build/test-data-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let database = try AppDatabase(rootURL: root)
+        let now = Date()
+        var meeting = SessionRecord(
+            id: UUID(), kind: .meeting, title: "Live meeting", state: .recording,
+            startedAt: now, endedAt: nil, duration: 0,
+            sourceApplication: nil, sourceBundleIdentifier: nil,
+            modelSnapshot: "{}", audioRelativePath: nil, summary: nil,
+            errorMessage: nil, createdAt: now, updatedAt: now
+        )
+        try database.insertSession(meeting)
+        let work = try #require(try database.addTag(named: "Work", to: meeting.id))
+        _ = try database.addTag(named: "work", to: meeting.id)
+        let temporary = try #require(try database.addTag(named: "Temporary", to: meeting.id))
+        try database.removeTag(id: temporary.id, from: meeting.id)
+        #expect(try database.sessionDetail(id: meeting.id)?.session.state == .recording)
+        #expect(try database.sessionDetail(id: meeting.id)?.tags.map(\.id) == [work.id])
+
+        // The recorder's original session snapshot carries no tag data.
+        meeting.state = .processing
+        meeting.endedAt = now.addingTimeInterval(60)
+        meeting.duration = 60
+        try database.updateSession(meeting)
+        meeting.state = .completed
+        try database.updateSession(meeting)
+        try database.replaceSegments([
+            TranscriptSegmentRecord(
+                id: UUID(), sessionID: meeting.id, position: 0, start: 0, end: 2,
+                channel: .microphone, speaker: "You", originalText: "Hello",
+                editedText: "Hello"
+            )
+        ], for: meeting)
+        let detail = try #require(try database.sessionDetail(id: meeting.id))
+        #expect(detail.session.state == .completed)
+        #expect(detail.tags.map(\.id) == [work.id])
+        #expect(try database.allTags().map(\.id) == [work.id])
+    }
+
     @Test func tagsAttachFilterAndPruneWhenUnused() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appending(path: ".build/test-data-\(UUID().uuidString)", directoryHint: .isDirectory)

@@ -278,6 +278,7 @@ final class SettingsStore {
         /// catalog. Skips meetings that already have any tags, and never creates
         /// new catalog entries.
         var automaticallyTagMeetings = true
+        var meetingCheckIn = MeetingCheckInConfiguration()
 
         var launchAtLogin = false
         var playCues = true
@@ -339,6 +340,7 @@ final class SettingsStore {
                 .automaticallyTagMeetings,
                 fallback.automaticallyTagMeetings
             )
+            meetingCheckIn = value(.meetingCheckIn, fallback.meetingCheckIn)
             launchAtLogin = value(.launchAtLogin, fallback.launchAtLogin)
             playCues = value(.playCues, fallback.playCues)
             showHUD = value(.showHUD, fallback.showHUD)

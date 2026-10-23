@@ -6,6 +6,39 @@ import Testing
 @MainActor
 @Suite("HUD panel lifecycle", .serialized)
 struct HUDPresenterTests {
+    @Test("Only the live meeting tag editor enables keyboard input")
+    func meetingTagKeyboardFocus() throws {
+        let presenter = HUDPresenter()
+        defer { presenter.dismissImmediately() }
+        presenter.update(phase: .recording(.meeting, startedAt: Date()), enabled: true)
+        let panel = try #require(NSApplication.shared.windows.compactMap { $0 as? HUDPanel }
+            .first { $0.isVisible })
+        #expect(!panel.canBecomeKey)
+        #expect(!panel.canBecomeMain)
+
+        presenter.setEditingMeetingTags(true)
+        #expect(presenter.isEditingMeetingTags)
+        #expect(panel.canBecomeKey)
+        #expect(panel.isKeyWindow)
+        presenter.setEditingMeetingTags(false)
+        #expect(!presenter.isEditingMeetingTags)
+        #expect(!panel.canBecomeKey)
+
+        presenter.setEditingMeetingTags(true)
+        presenter.update(phase: .transcribing(.meeting, progress: 0), enabled: true)
+        #expect(!presenter.isEditingMeetingTags)
+        #expect(!panel.canBecomeKey)
+        presenter.setEditingMeetingTags(true)
+        #expect(!presenter.isEditingMeetingTags)
+
+        presenter.update(phase: .recording(.meeting, startedAt: Date()), enabled: true)
+        presenter.setEditingMeetingTags(true)
+        presenter.hideMeetingTimer()
+        #expect(!presenter.isEditingMeetingTags)
+        #expect(!panel.canBecomeKey)
+        #expect(!panel.isVisible)
+    }
+
     @Test("Hiding a meeting timer lasts for that recording only")
     func hideMeetingTimer() throws {
         let presenter = HUDPresenter()

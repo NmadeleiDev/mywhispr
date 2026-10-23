@@ -291,7 +291,14 @@ final class AppRuntime {
 
     private var dictationTarget: FocusedTextTarget?
     private var activeMeeting: SessionRecord?
+    var activeMeetingID: UUID? { activeMeeting?.id }
+    var activeMeetingTags: [TagRecord] {
+        guard let activeMeetingID else { return [] }
+        return tagsBySessionID[activeMeetingID] ?? []
+    }
     private var meetingStartedAt: Date?
+    @ObservationIgnored private var meetingCheckIn: MeetingCheckIn?
+    @ObservationIgnored private let meetingCheckInPresenter = MeetingCheckInPresenter()
     /// Present for persisted work (meetings and retried dictations), and assigned
     /// before its HUD state is published so cancellation always knows what it owns.
     private var processingSessionID: UUID?
@@ -859,7 +866,11 @@ final class AppRuntime {
         do {
             try database.insertSession(record)
             let captureMode = try meetingRecorder.start(directoryURL: directoryURL)
-            startLevelTicker(meetingRecorder.levels)
+            meetingCheckIn = MeetingCheckIn(
+                now: ProcessInfo.processInfo.systemUptime,
+                configuration: settings.payload.meetingCheckIn
+            )
+            startLevelTicker(meetingRecorder.levels, systemRelay: meetingRecorder.systemLevels)
             activeMeeting = record
             meetingStartedAt = startedAt
             phase = .recording(.meeting, startedAt: startedAt)
@@ -883,6 +894,8 @@ final class AppRuntime {
 
     func stopMeeting() {
         guard var record = activeMeeting else { return }
+        meetingCheckIn = nil
+        meetingCheckInPresenter.dismiss()
         let files = meetingRecorder.stop()
         // The meeting leaves the recording state whatever the recorder returns.
         // Bailing out before this point on a failed teardown used to leave the app
@@ -1410,17 +1423,23 @@ final class AppRuntime {
         }
     }
 
-    func addTag(named name: String, to sessionID: UUID) {
+    /// Returns an error message for editors hosted outside the main window.
+    @discardableResult
+    func addTag(named name: String, to sessionID: UUID) -> String? {
         do {
-            guard try database.addTag(named: name, to: sessionID) != nil else { return }
+            guard try database.addTag(named: name, to: sessionID) != nil else { return nil }
             loadSelectedDetail()
             reloadSessions()
+            return nil
         } catch {
-            fail(error)
+            logger.error("Tag could not be added: \(error.localizedDescription)")
+            toast.present(error.localizedDescription, tone: .failure)
+            return error.localizedDescription
         }
     }
 
-    func removeTag(_ tagID: UUID, from sessionID: UUID) {
+    @discardableResult
+    func removeTag(_ tagID: UUID, from sessionID: UUID) -> String? {
         do {
             try database.removeTag(id: tagID, from: sessionID)
             if selectedTagFilterIDs.contains(tagID) {
@@ -1431,8 +1450,11 @@ final class AppRuntime {
             }
             loadSelectedDetail()
             reloadSessions()
+            return nil
         } catch {
-            fail(error)
+            logger.error("Tag could not be removed: \(error.localizedDescription)")
+            toast.present(error.localizedDescription, tone: .failure)
+            return error.localizedDescription
         }
     }
 
@@ -1743,6 +1765,10 @@ final class AppRuntime {
             }
             loadSelectedDetail()
             reloadSessions()
+            LocalNotifier.shared.notifyTagsAssigned(
+                meetingTitle: detail.session.title,
+                tagNames: names
+            )
         } catch {
             fail(error)
         }
@@ -1854,20 +1880,50 @@ final class AppRuntime {
     /// 30 Hz, which is smoother than the eye needs and far cheaper than the ~47
     /// buffers a second the tap produces. The tap itself never calls into this
     /// class — it cannot — so this is the only path by which levels arrive.
-    private func startLevelTicker(_ relay: AudioLevelRelay) {
+    private func startLevelTicker(_ relay: AudioLevelRelay, systemRelay: AudioLevelRelay? = nil) {
         stopLevelTicker()
         meter.reset()
         levelTicker = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(33))
-                guard let self else { return }
-                self.meter.push(relay.drain())
+                guard !Task.isCancelled, let self else { return }
+                let level = max(relay.drain(), systemRelay?.drain() ?? 0)
+                self.meter.push(level)
+                self.meetingCheckIn?.recordActivity(
+                    level: level, now: ProcessInfo.processInfo.systemUptime
+                )
                 if let error = relay.takeError() {
                     self.logger.error("Recording error: \(error.localizedDescription)")
                     self.toast.present(error.localizedDescription, tone: .failure)
                 }
             }
         }
+    }
+
+    private func updateMeetingCheckIn() {
+        guard isMeetingActive else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        // Consume any audio awaiting the next meter frame before deciding to stop.
+        meetingCheckIn?.recordActivity(
+            level: max(meetingRecorder.levels.drain(), meetingRecorder.systemLevels.drain()),
+            now: now
+        )
+        if meetingCheckIn?.tick(now: now, configuration: settings.payload.meetingCheckIn) == true {
+            stopMeeting()
+            toast.present("Meeting stopped after silence. Your recording is being transcribed.", tone: .information)
+            return
+        }
+        meetingCheckInPresenter.update(
+            prompt: meetingCheckIn?.prompt,
+            now: now,
+            elapsed: meetingElapsed,
+            onContinue: { [weak self] in
+                guard let self, self.isMeetingActive else { return }
+                self.meetingCheckIn?.keepRecording(now: ProcessInfo.processInfo.systemUptime)
+                self.meetingCheckInPresenter.dismiss()
+            },
+            onStop: { [weak self] in self?.stopMeeting() }
+        )
     }
 
     private func stopLevelTicker() {
@@ -1881,8 +1937,9 @@ final class AppRuntime {
         elapsedTicker = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
-                guard let self, self.isMeetingActive else { return }
+                guard !Task.isCancelled, let self, self.isMeetingActive else { return }
                 self.meetingTick &+= 1
+                self.updateMeetingCheckIn()
             }
         }
     }
@@ -1983,7 +2040,13 @@ final class AppRuntime {
             sessions = trimmed.isEmpty
                 ? try database.recentSessions(kind: filter, matchingAnyTagIDs: tagFilter)
                 : try database.search(trimmed, kind: filter, matchingAnyTagIDs: tagFilter)
-            tagsBySessionID = try database.tags(for: sessions.map(\.id))
+            // The active meeting can be absent from filtered or limited history.
+            // Its HUD still needs the latest persisted tags.
+            var tagSessionIDs = sessions.map(\.id)
+            if let activeMeetingID, !tagSessionIDs.contains(activeMeetingID) {
+                tagSessionIDs.append(activeMeetingID)
+            }
+            tagsBySessionID = try database.tags(for: tagSessionIDs)
             availableTags = try database.allTags()
             // Drop filter IDs that no longer exist in the catalog.
             let known = Set(availableTags.map(\.id))

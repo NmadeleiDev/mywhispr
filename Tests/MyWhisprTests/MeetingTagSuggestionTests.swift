@@ -116,6 +116,19 @@ struct MeetingTagSuggestionTests {
             summary: "   "
         ))
     }
+
+    @Test func assignmentNoticeNamesTheMeetingAndTags() {
+        #expect(
+            MeetingTagAssignmentNotice.body(
+                meetingTitle: "Weekly sync",
+                tagNames: ["daily sync", "darwin"]
+            ) == "“Weekly sync” → daily sync, darwin"
+        )
+        #expect(
+            MeetingTagAssignmentNotice.body(meetingTitle: "  ", tagNames: ["Work"])
+                == "“Untitled meeting” → Work"
+        )
+    }
 }
 
 @Suite("Tag suggestion persistence")

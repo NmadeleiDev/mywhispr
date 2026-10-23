@@ -8,6 +8,7 @@ final class MeetingRecorder {
 
     /// The meeting's microphone level, for the recording indicator.
     var levels: AudioLevelRelay { microphone.levels }
+    var systemLevels: AudioLevelRelay { systemAudio.levels }
 
     func start(directoryURL: URL) throws -> MeetingCaptureMode {
         let microphoneURL = directoryURL.appending(path: "microphone.caf")

@@ -1,26 +1,57 @@
 import AppKit
 import SwiftUI
 
-/// The menu-bar icon.
-///
-/// Idle it is a static glyph; recording it becomes a live level meter. That is the
-/// requested confirmation that capture is really happening without having to look
-/// at the HUD — and it means a meeting recording stays visible for its whole run
-/// after the HUD pill has collapsed.
+/// Meetings keep a high-contrast REC badge and timer visible even in silence
+/// and when the floating recording timer is hidden.
 struct MenuBarLabel: View {
     var runtime: AppRuntime
 
     var body: some View {
-        if runtime.isCapturing {
+        if runtime.isMeetingActive {
+            Image(nsImage: MeetingMenuBarIndicator.image(elapsed: runtime.meetingElapsed))
+                .renderingMode(.original)
+                .accessibilityLabel("Recording meeting, \(Clock.string(runtime.meetingElapsed)) elapsed")
+        } else if runtime.isCapturing {
             MenuBarMeter(samples: runtime.meter.samples, isActive: true)
-                .foregroundStyle(Palette.accent)
         } else if runtime.isWorking {
-            Image(systemName: "waveform.badge.magnifyingglass")
+            menuBarSymbol("waveform.badge.magnifyingglass")
         } else if !runtime.permissions.dictationReady {
-            Image(systemName: "waveform.badge.exclamationmark")
+            menuBarSymbol("waveform.badge.exclamationmark")
         } else {
-            Image(systemName: "waveform")
+            menuBarSymbol("waveform")
         }
+    }
+
+    /// Menu-bar symbols have to stay template images. A fixed colour is rasterised
+    /// white and vanishes when the bar itself is light.
+    private func menuBarSymbol(_ name: String) -> some View {
+        Image(systemName: name)
+            .symbolRenderingMode(.monochrome)
+            .renderingMode(.template)
+    }
+}
+
+/// Draw the whole badge as original artwork: MenuBarExtra strips styling from
+/// ordinary view backgrounds. White-on-red stays legible on either menu bar theme.
+@MainActor
+enum MeetingMenuBarIndicator {
+    static func image(elapsed: TimeInterval) -> NSImage {
+        let title = "● REC  \(Clock.string(elapsed))"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .bold),
+            .foregroundColor: NSColor.white,
+        ]
+        let text = NSAttributedString(string: title, attributes: attributes)
+        let size = NSSize(width: ceil(text.size().width) + 16, height: 20)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor(srgbRed: 0.73, green: 0.06, blue: 0.13, alpha: 1).setFill()
+            NSBezierPath(roundedRect: rect.insetBy(dx: 0, dy: 1), xRadius: 5, yRadius: 5).fill()
+            text.draw(at: NSPoint(x: 8, y: (rect.height - text.size().height) / 2))
+            return true
+        }
+        image.isTemplate = false
+        image.accessibilityDescription = "Recording meeting, \(Clock.string(elapsed)) elapsed"
+        return image
     }
 }
 

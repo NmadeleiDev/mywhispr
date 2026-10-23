@@ -128,6 +128,19 @@ question view.
   name with filtered typeahead. Chips are colored by tag name, editable from the
   list or the detail view, and filterable with a multi-select Meetings filter
   that matches any selected tag.
+- See a persistent red **REC + elapsed time** badge in the menu bar while a
+  meeting records, even when the floating timer is hidden or nobody is speaking.
+- Check in every hour and after three minutes without sound from either the
+  microphone or Mac audio. Silence warnings allow 60 seconds to respond before
+  stopping and transcribing normally. Sound returning cancels the silence warning;
+  **Keep recording** resets both timers. Hourly reminders never stop a meeting on
+  their own. In **Settings → Meetings → Recording check-ins**, adjust or disable
+  reminders, silence checks, automatic stopping, response time, and sensitivity.
+  Detection measures sound level, not words: music and background noise above the
+  selected threshold also keep recording alive. Check-ins work with the HUD hidden
+  and without Notification Center permission.
+- Add or remove tags during recording with the tag button beside the floating
+  meeting timer. Changes save immediately and remain attached after transcription.
 - Rename meetings and speakers, edit individual passages, select and copy text,
   copy the complete transcript, and delete meetings with confirmation.
 - Copy the on-disk path of a meeting's microphone or Mac-audio recording when the

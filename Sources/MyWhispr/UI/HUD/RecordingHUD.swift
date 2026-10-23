@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 /// What the pill is currently saying. Derived from ``RecordingPhase`` plus the
@@ -59,6 +60,12 @@ enum HUDState: Equatable {
 struct RecordingHUD: View {
     var state: HUDState
     var meter: AudioLevelMeter
+    var meetingTags: [TagRecord]
+    var tagCatalog: [TagRecord]
+    @Binding var editingMeetingTags: Bool
+    /// Mutation callbacks return a message only when saving fails.
+    var onAddMeetingTag: (String) -> String?
+    var onRemoveMeetingTag: (UUID) -> String?
     var onCancel: () -> Void
     var onStopMeeting: () -> Void
     var onHideMeeting: () -> Void
@@ -66,6 +73,7 @@ struct RecordingHUD: View {
 
     @Namespace private var glass
     @State private var now = Date()
+    @State private var meetingTagError: String?
     /// Set by the first click on a meeting's stop control, cleared by the second or
     /// by the timeout below.
     @State private var confirmingDiscard = false
@@ -84,6 +92,7 @@ struct RecordingHUD: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onReceive(tick) { now = $0 }
+        .onChange(of: editingMeetingTags) { _, _ in meetingTagError = nil }
         .animation(.glassMorph, value: state)
     }
 
@@ -142,6 +151,51 @@ struct RecordingHUD: View {
                     .foregroundStyle(.secondary)
                     .tabularTime()
                     .frame(minWidth: collapsed ? 44 : 52, alignment: .trailing)
+                Button {
+                    editingMeetingTags.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: meetingTags.isEmpty ? "tag" : "tag.fill")
+                            .font(.system(size: 12, weight: .medium))
+                        if !meetingTags.isEmpty {
+                            Text("\(meetingTags.count)")
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                        }
+                    }
+                    .foregroundStyle(meetingTags.isEmpty ? Color.secondary : Palette.accent)
+                    .frame(minWidth: 24, minHeight: 24)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Edit meeting tags")
+                .accessibilityValue("\(meetingTags.count) tags")
+                .help("Add or remove meeting tags")
+                .popover(isPresented: $editingMeetingTags, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Meeting tags")
+                            .font(.system(size: 13, weight: .semibold))
+                        ScrollView {
+                            TagEditor(
+                                tags: meetingTags,
+                                catalog: tagCatalog,
+                                autofocus: true,
+                                onAdd: { meetingTagError = onAddMeetingTag($0) },
+                                onRemove: { meetingTagError = onRemoveMeetingTag($0) }
+                            )
+                            .padding(2)
+                        }
+                        .frame(height: 240)
+                        if let meetingTagError {
+                            Text(meetingTagError)
+                                .font(.system(size: 12))
+                                .foregroundStyle(Palette.danger)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(16)
+                    .frame(width: 300)
+                    .onExitCommand { editingMeetingTags = false }
+                }
                 if !collapsed {
                     Button(action: onStopMeeting) {
                         Image(systemName: "stop.fill")

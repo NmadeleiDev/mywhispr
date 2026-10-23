@@ -23,6 +23,7 @@ private final class TapContext: @unchecked Sendable {
     let targetFormat: AVAudioFormat
     let converter: AVAudioConverter
     let writer: AudioFileWriter
+    let levels: AudioLevelRelay
 
     private let stopFlag = ManagedAtomicFlag()
 
@@ -30,12 +31,14 @@ private final class TapContext: @unchecked Sendable {
         sourceFormat: AVAudioFormat,
         targetFormat: AVAudioFormat,
         converter: AVAudioConverter,
-        writer: AudioFileWriter
+        writer: AudioFileWriter,
+        levels: AudioLevelRelay
     ) {
         self.sourceFormat = sourceFormat
         self.targetFormat = targetFormat
         self.converter = converter
         self.writer = writer
+        self.levels = levels
     }
 
     func stop() { stopFlag.set() }
@@ -72,6 +75,7 @@ private final class TapContext: @unchecked Sendable {
         guard error == nil, status == .haveData || status == .inputRanDry else { return }
         guard outputBuffer.frameLength > 0 else { return }
         // Hands off rather than writing: see `AudioFileWriter`.
+        levels.store(PCMLevel.rms(outputBuffer))
         writer.write(outputBuffer)
     }
 }
@@ -94,6 +98,7 @@ private final class ManagedAtomicFlag: @unchecked Sendable {
 /// The tap is private and non-muting, so the owner keeps hearing the meeting
 /// normally and the selected output device is never changed.
 final class SystemAudioTapRecorder: @unchecked Sendable {
+    let levels = AudioLevelRelay()
     private let ioQueue = DispatchQueue(label: "app.mywhispr.system-audio", qos: .userInitiated)
 
     // Lifecycle state. Only ever touched by start/stop, never by the IO thread.
@@ -117,6 +122,7 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
     func start(outputURL: URL) throws {
         guard tapID == 0 else { throw AudioCaptureError.alreadyRecording }
         self.outputURL = outputURL
+        levels.reset()
 
         let description = CATapDescription()
         description.name = "MyWhispr System Audio"
@@ -155,7 +161,8 @@ final class SystemAudioTapRecorder: @unchecked Sendable {
                 sourceFormat: sourceFormat,
                 targetFormat: targetFormat,
                 converter: converter,
-                writer: fileWriter
+                writer: fileWriter,
+                levels: levels
             )
             context = tapContext
             try registerIOProc(context: tapContext)

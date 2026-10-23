@@ -7,6 +7,7 @@ struct TagEditor: View {
     var tags: [TagRecord]
     var catalog: [TagRecord]
     var compact = false
+    var autofocus = false
     var onAdd: (String) -> Void
     var onRemove: (UUID) -> Void
 
@@ -40,6 +41,14 @@ struct TagEditor: View {
     }
 
     var body: some View {
+        editor
+            .onAppear {
+                if autofocus { fieldFocused = true }
+            }
+    }
+
+    @ViewBuilder
+    private var editor: some View {
         if compact {
             compactBody
         } else {

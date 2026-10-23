@@ -6,7 +6,7 @@ import SwiftUI
 /// Three properties matter and all three are load-bearing for the product's
 /// defining moment — text landing at the live cursor:
 ///
-/// 1. It never becomes key or main, so holding Right Command while typing in Mail
+/// 1. It becomes key only for meeting tag editing, so dictating while typing in Mail
 ///    does not pull focus out of Mail's compose field.
 /// 2. It joins all Spaces and sits at status-bar level, so it is visible over
 ///    full-screen apps, where dictation is most useful.
@@ -14,6 +14,8 @@ import SwiftUI
 ///    clicks land on the pill but pass straight through the empty canvas around it.
 @MainActor
 final class HUDPanel: NSPanel {
+    var acceptsKeyboardInput = false
+
     init(size: CGSize) {
         super.init(
             contentRect: NSRect(origin: .zero, size: size),
@@ -35,7 +37,7 @@ final class HUDPanel: NSPanel {
         isExcludedFromWindowsMenu = true
     }
 
-    override var canBecomeKey: Bool { false }
+    override var canBecomeKey: Bool { acceptsKeyboardInput }
     override var canBecomeMain: Bool { false }
 }
 

@@ -30,6 +30,25 @@ struct UIRenderTests {
         #expect(selection.mode == .transcript)
     }
 
+    @Test func meetingCheckInPromptsRenderInBothAppearances() throws {
+        for (name, prompt) in [
+            ("hourly", MeetingCheckIn.Prompt.duration),
+            ("silence", .silence(deadline: 240)),
+            ("silence-manual", .silence(deadline: nil)),
+        ] {
+            for (appearance, scheme) in [("light", ColorScheme.light), ("dark", .dark)] {
+                try renderView(
+                    MeetingCheckInView(
+                        prompt: prompt, now: 180, elapsed: 3600,
+                        onContinue: {}, onStop: {}
+                    ).environment(\.colorScheme, scheme),
+                    size: NSSize(width: 420, height: 238),
+                    filename: "mywhispr-check-in-\(name)-\(appearance).png"
+                )
+            }
+        }
+    }
+
     @Test func workspaceSurfacesRenderAtWindowSize() throws {
         let root = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appending(path: ".build/render-data-\(UUID().uuidString)", directoryHint: .isDirectory)

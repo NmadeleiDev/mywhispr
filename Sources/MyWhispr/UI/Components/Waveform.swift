@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The live waveform inside the recording HUD.
@@ -36,11 +37,49 @@ struct WaveformView: View {
 }
 
 /// A four-bar meter small enough to live in the menu bar and still read as motion.
+///
+/// Drawn as a template image. MenuBarExtra rasterises a SwiftUI shape painted with
+/// a fixed colour — including the recording amber — as white, and a white glyph
+/// disappears on a light menu bar. Template artwork keeps only the alpha, so macOS
+/// tints the bars to contrast with whatever is behind the bar.
 struct MenuBarMeter: View {
     var samples: [Float]
     var isActive: Bool
 
-    private var buckets: [Float] {
+    var body: some View {
+        Image(nsImage: Self.templateImage(samples: samples, isActive: isActive))
+            .renderingMode(.template)
+            .accessibilityLabel(isActive ? "Recording" : "Level meter")
+    }
+
+    static func templateImage(samples: [Float], isActive: Bool) -> NSImage {
+        let canvas = NSSize(width: 15, height: 15)
+        let levels = buckets(from: samples)
+        let image = NSImage(size: canvas, flipped: false) { rect in
+            let barWidth: CGFloat = 2
+            let spacing: CGFloat = 1.5
+            let count = CGFloat(levels.count)
+            let contentWidth = count * barWidth + max(0, count - 1) * spacing
+            var x = (rect.width - contentWidth) / 2
+            for value in levels {
+                let height = barHeight(value, isActive: isActive)
+                let y = (rect.height - height) / 2
+                let bar = NSBezierPath(
+                    roundedRect: NSRect(x: x, y: y, width: barWidth, height: height),
+                    xRadius: barWidth / 2,
+                    yRadius: barWidth / 2
+                )
+                NSColor.black.setFill()
+                bar.fill()
+                x += barWidth + spacing
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
+    private static func buckets(from samples: [Float]) -> [Float] {
         guard !samples.isEmpty else { return Array(repeating: 0, count: 4) }
         // Average the newest 16 samples into 4 buckets so the tiny meter shows a
         // trend rather than jittering on single frames.
@@ -53,18 +92,7 @@ struct MenuBarMeter: View {
         }
     }
 
-    var body: some View {
-        HStack(alignment: .center, spacing: 1.5) {
-            ForEach(Array(buckets.enumerated()), id: \.offset) { _, value in
-                Capsule(style: .continuous)
-                    .frame(width: 2, height: barHeight(value))
-            }
-        }
-        .frame(width: 15, height: 15)
-        .animation(.levelFollow, value: buckets)
-    }
-
-    private func barHeight(_ value: Float) -> CGFloat {
+    private static func barHeight(_ value: Float, isActive: Bool) -> CGFloat {
         guard isActive else { return 3 }
         let shaped = pow(Double(min(max(value, 0), 1)), 0.6)
         return 3 + 10 * shaped

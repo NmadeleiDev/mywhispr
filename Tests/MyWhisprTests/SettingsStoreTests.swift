@@ -5,6 +5,22 @@ import Testing
 @MainActor
 @Suite("Settings persistence")
 struct SettingsStoreTests {
+    @Test func meetingCheckInsSurviveRelaunchAndPreserveExistingSettings() throws {
+        let suite = "MyWhisprTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(Data(#"{"showHUD":false,"localAI":{"model":"existing"}}"#.utf8), forKey: "settings.payload.v2")
+        let store = SettingsStore(defaults: defaults)
+        #expect(store.payload.meetingCheckIn == MeetingCheckInConfiguration())
+        #expect(!store.payload.showHUD)
+        #expect(store.payload.localAI.model == "existing")
+        store.payload.meetingCheckIn.remindersEnabled = false
+        store.payload.meetingCheckIn.silenceMinutes = 5
+        store.payload.meetingCheckIn.countdownSeconds = 90
+        store.payload.meetingCheckIn.silenceThresholdDB = -54
+        #expect(SettingsStore(defaults: defaults).payload == store.payload)
+    }
+
     @Test func roundTripsIndependentWorkflowModels() throws {
         let suite = "MyWhisprTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))

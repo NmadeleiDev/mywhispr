@@ -57,8 +57,9 @@ struct SettingRow<Control: View>: View {
                 }
             }
             Spacer(minLength: 12)
+            // Each control owns its label visibility. Stepper labels carry the
+            // current value, so hiding every descendant label conceals settings.
             control
-                .labelsHidden()
         }
     }
 }

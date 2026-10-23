@@ -12,6 +12,7 @@ import SwiftUI
 @Observable
 final class HUDPresenter {
     private(set) var state: HUDState = .hidden
+    private(set) var isEditingMeetingTags = false
 
     @ObservationIgnored private var panel: HUDPanel?
     @ObservationIgnored private var dismissTask: Task<Void, Never>?
@@ -127,10 +128,30 @@ final class HUDPresenter {
         dismissImmediately()
     }
 
+    /// Keyboard focus belongs to the HUD only while editing a live meeting's tags.
+    func setEditingMeetingTags(_ editing: Bool) {
+        if editing {
+            guard case .meeting = state else { return }
+        }
+        isEditingMeetingTags = editing
+        panel?.acceptsKeyboardInput = editing
+        if editing {
+            panel?.makeKey()
+        } else if panel?.isKeyWindow == true {
+            panel?.resignKey()
+        }
+    }
+
     // MARK: - Panel lifecycle
 
     private func transition(to next: HUDState) {
         guard next != state else { return }
+        switch next {
+        case .meeting:
+            break
+        default:
+            setEditingMeetingTags(false)
+        }
         state = next
         if next.isVisible {
             showPanel()
@@ -144,6 +165,7 @@ final class HUDPresenter {
 
     private func flash(_ next: HUDState, for duration: Duration) {
         cancelDismiss()
+        setEditingMeetingTags(false)
         state = next
         showPanel()
         dismissTask = Task { [weak self] in
@@ -211,6 +233,20 @@ private struct HUDHost: View {
             RecordingHUD(
                 state: presenter.state,
                 meter: runtime.meter,
+                meetingTags: runtime.activeMeetingTags,
+                tagCatalog: runtime.availableTags,
+                editingMeetingTags: Binding(
+                    get: { presenter.isEditingMeetingTags },
+                    set: { presenter.setEditingMeetingTags($0) }
+                ),
+                onAddMeetingTag: { name in
+                    guard let id = runtime.activeMeetingID else { return nil }
+                    return runtime.addTag(named: name, to: id)
+                },
+                onRemoveMeetingTag: { tagID in
+                    guard let id = runtime.activeMeetingID else { return nil }
+                    return runtime.removeTag(tagID, from: id)
+                },
                 onCancel: { runtime.cancelDictation() },
                 onStopMeeting: { runtime.stopMeeting() },
                 onHideMeeting: { presenter.hideMeetingTimer() },

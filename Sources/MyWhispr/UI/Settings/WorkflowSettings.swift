@@ -281,6 +281,54 @@ struct MeetingSettings: View {
             }
 
             Card(
+                title: "Recording check-ins",
+                footnote: "Check-ins appear even when the floating timer is hidden. Changing these settings during a meeting resets the check-in timers."
+            ) {
+                SettingRow(label: "Ask if the meeting is still in progress") {
+                    Toggle("", isOn: $settings.payload.meetingCheckIn.remindersEnabled)
+                }
+                if settings.payload.meetingCheckIn.remindersEnabled {
+                    SettingRow(label: "Remind me every") {
+                        Stepper(value: $settings.payload.meetingCheckIn.reminderMinutes, in: 15...240, step: 15) {
+                            Text("\(settings.payload.meetingCheckIn.reminderMinutes) min")
+                        }
+                    }
+                }
+                SettingRow(label: "Check after silence") {
+                    Toggle("", isOn: $settings.payload.meetingCheckIn.silenceEnabled)
+                }
+                if settings.payload.meetingCheckIn.silenceEnabled {
+                    SettingRow(label: "Ask after no sound for") {
+                        Stepper(value: $settings.payload.meetingCheckIn.silenceMinutes, in: 1...30) {
+                            Text("\(settings.payload.meetingCheckIn.silenceMinutes) min")
+                        }
+                    }
+                    SettingRow(label: "Stop automatically if silence continues") {
+                        Toggle("", isOn: $settings.payload.meetingCheckIn.autoStopEnabled)
+                    }
+                    if settings.payload.meetingCheckIn.autoStopEnabled {
+                        SettingRow(label: "Time to respond") {
+                            Stepper(value: $settings.payload.meetingCheckIn.countdownSeconds, in: 15...300, step: 15) {
+                                Text("\(settings.payload.meetingCheckIn.countdownSeconds) sec")
+                            }
+                        }
+                    }
+                    SettingRow(
+                        label: "Sound sensitivity",
+                        detail: "Higher sensitivity detects quieter voices. Lower it if background noise keeps the recording running. Music and other sounds also count as activity."
+                    ) {
+                        Picker("Sound sensitivity", selection: $settings.payload.meetingCheckIn.silenceThresholdDB) {
+                            Text("High").tag(-54)
+                            Text("Normal").tag(-42)
+                            Text("Low").tag(-30)
+                        }
+                        .labelsHidden()
+                        .frame(width: 130)
+                    }
+                }
+            }
+
+            Card(
                 title: "Automatic notes",
                 footnote: "After the transcript is ready, your local model writes a summary and gives the meeting a descriptive title. Meetings waiting on another summary are handled in order."
             ) {
